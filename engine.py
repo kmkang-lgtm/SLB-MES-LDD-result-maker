@@ -25,6 +25,23 @@ def item_to_sheetname(item_name: str) -> str:
     name = name.replace("FRT Side", "FS 1").replace("RR Side", "RS 1")
     return name
 
+def safe_to_datetime(col):
+    """
+    측정일시 컬럼에 문자열/빈값/엑셀시리얼 등이 섞여 있어도 안전하게 변환.
+    - 1차: 일반 to_datetime(errors='coerce')
+    - NaT가 너무 많으면(절반 이상) 2차: 엑셀 시리얼(origin)로 재시도
+    """
+    dt = pd.to_datetime(col, errors="coerce")
+
+    # NaT가 절반 이상이면 엑셀 시리얼 숫자 가능성도 체크
+    if dt.isna().mean() > 0.5:
+        num = pd.to_numeric(col, errors="coerce")
+        dt2 = pd.to_datetime(num, unit="d", origin="1899-12-30", errors="coerce")
+        if dt2.notna().sum() > dt.notna().sum():
+            dt = dt2
+
+    return dt
+
 def load_lane_raw(xl: pd.ExcelFile, sheets):
     dfs = []
     for sh in sheets:
@@ -35,7 +52,10 @@ def load_lane_raw(xl: pd.ExcelFile, sheets):
     raw["항목명"] = raw["항목명"].astype(str)
     raw["dtype"] = raw["항목명"].apply(detect_dtype)
 
-    raw["측정일시"] = pd.to_datetime(raw["측정일시"])
+    # ✅ 안전 날짜 파싱 + 실패 행 제거
+    raw["측정일시"] = safe_to_datetime(raw["측정일시"])
+    raw = raw.dropna(subset=["측정일시"])
+
     raw["hour"] = raw["측정일시"].dt.hour
     raw["val"] = pd.to_numeric(raw["측정값"], errors="coerce")
     return raw
