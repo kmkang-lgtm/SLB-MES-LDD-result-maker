@@ -9,6 +9,9 @@ from engine import make_results_for_input
 
 st.set_page_config(page_title="SLB MES Result Maker", layout="wide")
 
+# =========================================================
+# 0) 비밀번호 게이트 (Secrets 기반)
+# =========================================================
 DEFAULT_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 if not DEFAULT_PASSWORD:
     st.error("관리자에게 비밀번호 설정(Secrets)을 요청하세요.")
@@ -33,93 +36,38 @@ if not st.session_state["authed"]:
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_KHD_TPL = os.path.join(APP_DIR, "templates", "TEMPLATE_KHD.xlsx")
 DEFAULT_WPH_TPL = os.path.join(APP_DIR, "templates", "TEMPLATE_WPH.xlsx")
-LOGO_PATH = os.path.join(APP_DIR, "assets", "logo.png")
 
 # =========================
-# 로고/크레딧 (상단 우측 / 하단 우측 고정)
+# 로고 찾기(파일 기반) + Base64도 유지
 # =========================
-def find_logo_b64():
-    """
-    로고를 여러 기준 경로에서 찾는다.
-    1) app.py 기준 APP_DIR/assets/logo.*
-    2) 현재 실행 폴더(cwd)/assets/logo.*
-    logo.png/jpg/jpeg 모두 허용
-    """
+def find_logo_path():
     exts = ["png", "jpg", "jpeg"]
     search_dirs = [
         Path(APP_DIR) / "assets",
         Path(os.getcwd()) / "assets",
     ]
-
     for d in search_dirs:
         for ext in exts:
             p = d / f"logo.{ext}"
             if p.exists():
-                with open(p, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode()
-                mime = "image/png" if ext == "png" else "image/jpeg"
-                return b64, mime, str(p)
+                return str(p)
+    return None
 
-    return None, None, None
-
-
-logo_b64, logo_mime, logo_path_found = find_logo_b64()
-
-# 🔎 못 찾았을 때는 경로를 화면에 보여줘서 바로 원인 확인 가능
-if logo_b64 is None:
-    st.warning(
-        "로고 파일을 찾지 못했습니다.\n"
-        f"- APP_DIR 기준: {Path(APP_DIR)/'assets'}\n"
-        f"- CWD 기준: {Path(os.getcwd())/'assets'}\n"
-        "assets 폴더에 logo.png(또는 jpg/jpeg)를 넣어주세요."
-    )
-
-st.markdown(
-    f"""
-    <style>
-    .top-right-logo {{
-        position: fixed;
-        top: 12px;
-        right: 16px;
-        z-index: 9999;
-        display: flex;
-        align-items: center;
-        opacity: 0.95;
-        pointer-events: none;
-        background: rgba(255,255,255,0.95);
-        padding: 6px 8px;
-        border-radius: 10px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-    }}
-    .top-right-logo img {{
-        height: 56px;
-        width: auto;
-        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.2));
-    }}
-    .bottom-right-credit {{
-        position: fixed;
-        bottom: 10px;
-        right: 14px;
-        z-index: 9999;
-        font-size: 12px;
-        color: rgba(120,120,120,0.9);
-        font-family: Arial, sans-serif;
-        letter-spacing: 0.2px;
-        pointer-events: none;
-    }}
-    </style>
-
-    {f"<div class='top-right-logo'><img src='data:{logo_mime};base64,{logo_b64}' /></div>" if logo_b64 else ""}
-    <div class="bottom-right-credit">by.kkm</div>
-    """,
-    unsafe_allow_html=True
-)
+logo_path_found = find_logo_path()
 
 # =========================
-# 타이틀
+# ✅ 헤더(로고 + 타이틀) : 화면 상단에 항상 보이게
+#    - fixed CSS 제거하고 streamlit 레이아웃 안으로 넣음
 # =========================
-st.title("SLB MES 결과 생성기")
-st.caption("KHD/WPH 원본을 파싱해 Lane1/2 Result를 템플릿 기반으로 자동 생성합니다.")
+col_title, col_logo = st.columns([5, 1], vertical_alignment="center")
+with col_title:
+    st.title("SLB MES 결과 생성기")
+    st.caption("KHD/WPH 원본을 파싱해 Lane1/2 Result를 템플릿 기반으로 자동 생성합니다.")
+with col_logo:
+    if logo_path_found:
+        st.image(logo_path_found, use_container_width=True)
+    else:
+        st.caption("⚠️ logo.png 없음")
 
 # =========================
 # 세션 상태(다운로드 눌러도 결과 유지)
@@ -142,18 +90,12 @@ def safe_read_bytes(path: Path, retries: int = 2):
                 return f.read()
         except PermissionError as e:
             last_err = e
-            # 재시도 전 GC로 핸들 해제 시도
             gc.collect()
     raise last_err
 
 
 def save_uploaded_to_temp(uploaded_file, tmp_dir: Path):
-    """
-    업로드 파일을 tmp_dir에 저장.
-    - Path 기반
-    - 파일명 안전화
-    """
-    fname = Path(uploaded_file.name).name  # 혹시 경로 포함돼도 basename만
+    fname = Path(uploaded_file.name).name
     out_path = tmp_dir / fname
     with open(out_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -190,9 +132,31 @@ with st.sidebar:
         help="템플릿 차트가 참조하는 Raw 데이터의 마지막 행"
     )
 
+    st.subheader("시간 필터(선택)")
+    st.caption("선택한 시간만 결과/그래프에 포함됩니다. 비워두면 전체 자동 포함.")
+
+    hour_options = list(range(0, 24))  # 실제 hour 값
+    hour_labels_ui = [24 if h == 0 else h for h in hour_options]
+
+    selected_ui = st.multiselect(
+        "포함할 시간 선택",
+        options=hour_labels_ui,
+        default=[],
+        help="예: 8,9,10만 선택하면 그 시간만 결과에 표시"
+    )
+
+    # UI 24 -> 실제 hour 0 변환
+    selected_hours = [0 if h == 24 else h for h in selected_ui]
+
     col1, col2 = st.columns(2)
     run_btn = col1.button("🚀 실행", use_container_width=True)
     clear_btn = col2.button("🧹 결과 초기화", use_container_width=True)
+
+    st.divider()
+    st.markdown(
+        "<div style='font-size:12px;color:gray;text-align:right;'>BYKKM</div>",
+        unsafe_allow_html=True
+    )
 
 # =========================
 # 결과 초기화
@@ -238,7 +202,6 @@ if run_btn:
         st.stop()
 
     with st.spinner("파싱 및 결과 생성 중..."):
-        # ✅ ignore_cleanup_errors=True : 임시폴더 삭제 시 잠금 남아도 에러 방지
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp_dir = Path(tmp)
 
@@ -261,29 +224,24 @@ if run_btn:
                     raw_path,
                     templates=templates,
                     output_dir=str(tmp_dir),
-                    raw_end_row=raw_end_row
+                    raw_end_row=raw_end_row,
+                    selected_hours=selected_hours  # ✅ 시간 필터 반영
                 )
                 created_paths.extend(created)
-
-                # ✅ engine 내부에서 openpyxl/pandas 핸들이 남을 수 있어 GC로 한번 정리
                 gc.collect()
 
-            # 결과 파일을 bytes로 보관
             all_created_bytes = []
             for p in created_paths:
                 p_path = Path(p)
                 data = safe_read_bytes(p_path)
                 all_created_bytes.append((p_path.name, data))
 
-            # ZIP bytes 생성
             zip_path = tmp_dir / "SLB_MES_Result_Package.zip"
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for p in created_paths:
                     zf.write(p, arcname=Path(p).name)
 
             zip_bytes = safe_read_bytes(zip_path)
-
-            # ✅ 마지막으로 한번 더 정리
             gc.collect()
 
             st.session_state["results"] = all_created_bytes
