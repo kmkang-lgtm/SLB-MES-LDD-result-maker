@@ -2,16 +2,17 @@ import streamlit as st
 import tempfile
 import os
 import zipfile
-import base64
 import gc
 from pathlib import Path
+
 from engine import make_results_for_input
+from summary_engine import build_from_zip_bytes  # Summary 기능
+
 
 st.set_page_config(page_title="SLB MES Result Maker", layout="wide")
 
-# =========================================================
+
 # 0) 비밀번호 게이트 (Secrets 기반)
-# =========================================================
 DEFAULT_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 if not DEFAULT_PASSWORD:
     st.error("관리자에게 비밀번호 설정(Secrets)을 요청하세요.")
@@ -30,16 +31,13 @@ if not st.session_state["authed"]:
     else:
         st.stop()
 
-# =========================
 # 경로 설정
-# =========================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_KHD_TPL = os.path.join(APP_DIR, "templates", "TEMPLATE_KHD.xlsx")
 DEFAULT_WPH_TPL = os.path.join(APP_DIR, "templates", "TEMPLATE_WPH.xlsx")
 
-# =========================
-# 로고 찾기(파일 기반) + Base64도 유지
-# =========================
+
+# 로고 찾기
 def find_logo_path():
     exts = ["png", "jpg", "jpeg"]
     search_dirs = [
@@ -55,10 +53,8 @@ def find_logo_path():
 
 logo_path_found = find_logo_path()
 
-# =========================
-# ✅ 헤더(로고 + 타이틀) : 화면 상단에 항상 보이게
-#    - fixed CSS 제거하고 streamlit 레이아웃 안으로 넣음
-# =========================
+
+# 헤더(타이틀 + 로고)
 col_title, col_logo = st.columns([5, 1], vertical_alignment="center")
 with col_title:
     st.title("SLB MES 결과 생성기")
@@ -69,9 +65,8 @@ with col_logo:
     else:
         st.caption("⚠️ logo.png 없음")
 
-# =========================
-# 세션 상태(다운로드 눌러도 결과 유지)
-# =========================
+
+# 세션 상태
 if "results" not in st.session_state:
     st.session_state["results"] = []     # [(filename, bytes), ...]
 if "zip_bytes" not in st.session_state:
@@ -79,10 +74,6 @@ if "zip_bytes" not in st.session_state:
 
 
 def safe_read_bytes(path: Path, retries: int = 2):
-    """
-    Windows에서 간헐적으로 파일 잠금이 남는 경우가 있어
-    bytes 읽기만 가볍게 재시도.
-    """
     last_err = None
     for _ in range(retries + 1):
         try:
@@ -102,9 +93,7 @@ def save_uploaded_to_temp(uploaded_file, tmp_dir: Path):
     return str(out_path)
 
 
-# =========================
 # 사이드바 UI
-# =========================
 with st.sidebar:
     st.header("STEP 1) 원본 파일 선택")
     raw_files = st.file_uploader(
@@ -145,7 +134,6 @@ with st.sidebar:
         help="예: 8,9,10만 선택하면 그 시간만 결과에 표시"
     )
 
-    # UI 24 -> 실제 hour 0 변환
     selected_hours = [0 if h == 24 else h for h in selected_ui]
 
     col1, col2 = st.columns(2)
@@ -158,17 +146,15 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# =========================
+
 # 결과 초기화
-# =========================
 if clear_btn:
     st.session_state["results"] = []
     st.session_state["zip_bytes"] = None
     st.success("결과를 초기화했습니다. 다시 실행하세요.")
 
-# =========================
+
 # 메인 화면: 현재 선택 표시
-# =========================
 left, right = st.columns([1.2, 1])
 
 with left:
@@ -189,9 +175,8 @@ with right:
 
 st.divider()
 
-# =========================
+
 # 실행
-# =========================
 if run_btn:
     if not raw_files:
         st.error("원본 파일을 하나 이상 선택해줘.")
@@ -205,7 +190,6 @@ if run_btn:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp_dir = Path(tmp)
 
-            # 템플릿 경로 결정(기본 -> 업로드 있으면 덮어쓰기)
             final_khd_tpl = DEFAULT_KHD_TPL
             final_wph_tpl = DEFAULT_WPH_TPL
 
@@ -225,7 +209,7 @@ if run_btn:
                     templates=templates,
                     output_dir=str(tmp_dir),
                     raw_end_row=raw_end_row,
-                    selected_hours=selected_hours  # ✅ 시간 필터 반영
+                    selected_hours=selected_hours
                 )
                 created_paths.extend(created)
                 gc.collect()
@@ -249,18 +233,17 @@ if run_btn:
 
     st.success("완료! 아래에서 결과 파일을 다운로드하세요.")
 
-# =========================
-# 결과 표시(세션 상태 기반)
-# =========================
+
+# 결과 표시
 if st.session_state["results"]:
     st.subheader("개별 결과 파일")
-    for filename, data in st.session_state["results"]:
+    for i, (filename, data) in enumerate(st.session_state["results"]):
         st.download_button(
             label=f"⬇️ {filename}",
             data=data,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"dl-{filename}"
+            key=f"dl-{i}-{filename}"   # ✅ 중복 key 방지
         )
 
     st.subheader("전체 ZIP")
@@ -273,3 +256,46 @@ if st.session_state["results"]:
     )
 else:
     st.info("원본을 선택하고 실행을 누르면 결과가 표시됩니다.")
+
+
+# ✅ Deviation Summary 생성(Zip 기반)
+st.divider()
+st.subheader("Deviation Summary 생성")
+
+zip_upload = st.file_uploader(
+    "기존 SLB_MES_Result_Package_XX.XX.zip을 업로드하면 Summary를 생성합니다.",
+    type=["zip"],
+    key="zip_uploader_for_summary"
+)
+
+use_latest_zip = st.checkbox("방금 생성된 ZIP으로 Summary 만들기", value=False)
+
+if st.button("📌 Summary 생성하기", use_container_width=True):
+    try:
+        if use_latest_zip:
+            if st.session_state.get("zip_bytes") is None:
+                st.error("먼저 결과 ZIP을 생성한 뒤 체크하세요.")
+                st.stop()
+            zip_bytes = st.session_state["zip_bytes"]
+            zip_name = "SLB_MES_Result_Package.zip"
+        else:
+            if zip_upload is None:
+                st.error("ZIP 파일을 업로드하거나, '방금 생성된 ZIP'을 선택하세요.")
+                st.stop()
+            zip_bytes = zip_upload.getbuffer()
+            zip_name = zip_upload.name
+
+        with st.spinner("Summary 생성 중..."):
+            summary_name, summary_bytes = build_from_zip_bytes(zip_bytes, zip_name)
+
+        st.success("Summary 생성 완료!")
+        st.download_button(
+            "⬇️ Summary 다운로드",
+            data=summary_bytes,
+            file_name=summary_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl-summary"
+        )
+
+    except Exception as e:
+        st.error(f"Summary 생성 실패: {e}")
