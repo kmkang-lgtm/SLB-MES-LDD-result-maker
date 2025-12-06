@@ -131,6 +131,14 @@ if "zip_filename" not in st.session_state:
     st.session_state["zip_filename"] = None
 
 
+def safe_gc_collect():
+    """Streamlit Cloud에서 UploadedFile 버퍼 충돌(BufferError) 방지."""
+    try:
+        gc.collect()
+    except BufferError:
+        pass
+
+
 def safe_read_bytes(path: Path, retries: int = 2):
     last_err = None
     for _ in range(retries + 1):
@@ -139,15 +147,20 @@ def safe_read_bytes(path: Path, retries: int = 2):
                 return f.read()
         except PermissionError as e:
             last_err = e
-            gc.collect()
+            safe_gc_collect()
     raise last_err
 
 
 def save_uploaded_to_temp(uploaded_file, tmp_dir: Path):
+    """
+    UploadedFile을 임시폴더에 저장.
+    - getbuffer 대신 getvalue 사용: Streamlit Cloud 안정성↑
+    """
     fname = Path(uploaded_file.name).name
     out_path = tmp_dir / fname
+    data = uploaded_file.getvalue()  # ✅ bytes 복사본
     with open(out_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        f.write(data)
     return str(out_path)
 
 
@@ -233,8 +246,8 @@ with st.sidebar:
     selected_hours = [0 if h == 24 else h for h in selected_ui]
 
     col1, col2 = st.columns(2)
-    run_btn = col1.button("🚀 실행", width="stretch")
-    clear_btn = col2.button("🧹 결과 초기화", width="stretch")
+    run_btn = col1.button("🚀 실행", width="stretch", key="btn-run")
+    clear_btn = col2.button("🧹 결과 초기화", width="stretch", key="btn-clear")
 
     st.divider()
     st.markdown(
@@ -340,7 +353,7 @@ if run_btn:
                     selected_hours=selected_hours
                 )
                 created_paths.extend(created)
-                gc.collect()
+                safe_gc_collect()
 
             all_created_bytes = []
             for p in created_paths:
@@ -401,9 +414,9 @@ zip_upload = st.file_uploader(
     key="zip_uploader_for_summary"
 )
 
-use_latest_zip = st.checkbox("방금 생성된 ZIP으로 Summary 만들기", value=False)
+use_latest_zip = st.checkbox("방금 생성된 ZIP으로 Summary 만들기", value=False, key="chk-use-latest-zip")
 
-if st.button("📌 Summary 생성하기", width="stretch"):
+if st.button("📌 Summary 생성하기", width="stretch", key="btn-build-summary"):
     try:
         if use_latest_zip:
             if st.session_state.get("zip_bytes") is None:
@@ -415,7 +428,8 @@ if st.button("📌 Summary 생성하기", width="stretch"):
             if zip_upload is None:
                 st.error("ZIP 파일을 업로드하거나, '방금 생성된 ZIP'을 선택하세요.")
                 st.stop()
-            zip_bytes = zip_upload.getbuffer()
+            # ✅ getvalue() 사용
+            zip_bytes = zip_upload.getvalue()
             zip_name = zip_upload.name
 
         with st.spinner("Summary 생성 중..."):
@@ -453,22 +467,40 @@ dash_zip = st.file_uploader(
 
 dash_files = st.file_uploader(
     "방법 B) Summary 엑셀 여러 개 업로드(선택)",
-    type=["xlsx"],
+    type=["xlsx", "xlsm"],
     accept_multiple_files=True,
     key="xlsx_uploader_for_dashboard"
 )
 
-if st.button("📊 Dashboard 생성하기", width="stretch"):
+use_latest_zip_for_dash = st.checkbox(
+    "방금 생성된 ZIP으로 Dashboard 만들기",
+    value=False,
+    key="chk-use-latest-zip-for-dash"
+)
+
+if st.button("📊 Dashboard 생성하기", width="stretch", key="btn-build-dashboard"):
     try:
-        if dash_zip is not None:
-            zip_bytes = dash_zip.getbuffer()
+        if use_latest_zip_for_dash:
+            if st.session_state.get("zip_bytes") is None:
+                st.error("먼저 결과 ZIP을 생성한 뒤 체크하세요.")
+                st.stop()
+            zip_bytes = st.session_state["zip_bytes"]
+            zip_name = st.session_state.get("zip_filename", "SLB_MES_Result_Package.zip")
+
+            with st.spinner("Dashboard 생성 중...(최신 ZIP)"):
+                dash_name, dash_bytes = build_dashboard_from_zip_bytes(zip_bytes, zip_name)
+
+        elif dash_zip is not None:
+            # ✅ getvalue() 사용
+            zip_bytes = dash_zip.getvalue()
             zip_name = dash_zip.name
 
             with st.spinner("Dashboard 생성 중...(ZIP)"):
                 dash_name, dash_bytes = build_dashboard_from_zip_bytes(zip_bytes, zip_name)
 
         elif dash_files:
-            file_bytes_list = [(f.name, f.getbuffer()) for f in dash_files]
+            # ✅ getvalue()로 bytes 복사본 생성
+            file_bytes_list = [(f.name, f.getvalue()) for f in dash_files]
 
             with st.spinner("Dashboard 생성 중...(엑셀 개별)"):
                 dash_name, dash_bytes = build_dashboard_from_file_bytes(file_bytes_list)
