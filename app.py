@@ -8,7 +8,10 @@ from pathlib import Path
 
 from engine import make_results_for_input
 from summary_engine import build_from_zip_bytes
-
+from dashboard_engine import (
+    build_dashboard_from_zip_bytes,
+    build_dashboard_from_file_bytes
+)
 
 st.set_page_config(page_title="SLB MES Result Maker", layout="wide")
 
@@ -84,7 +87,7 @@ def extract_mmdd(text: str):
     m = _DATE_RE_MMDD.search(text)
     if m:
         mm, dd = m.groups()
-        mm = mm.zfill(2)  # 8.01 같은 경우 08.01로
+        mm = mm.zfill(2)
         return f"{mm}.{dd}"
 
     return None
@@ -151,7 +154,6 @@ def save_uploaded_to_temp(uploaded_file, tmp_dir: Path):
 def extract_raw_zip_to_paths(raw_zip_file, tmp_dir: Path):
     """
     raw zip(폴더 압축)을 풀어서 안에 있는 xlsx 전부 찾아 경로 리스트로 반환
-    - 폴더 구조가 있어도 rglob로 다 찾음
     """
     zip_path = Path(save_uploaded_to_temp(raw_zip_file, tmp_dir))
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -170,7 +172,7 @@ with col_title:
     st.caption("KHD/WPH 원본을 파싱해 Lane1/2 Result를 템플릿 기반으로 자동 생성합니다.")
 with col_logo:
     if logo_path_found:
-        st.image(logo_path_found, width="stretch")   # ✅ use_container_width 제거
+        st.image(logo_path_found, width="stretch")
     else:
         st.caption("⚠️ logo.png 없음")
 
@@ -231,8 +233,8 @@ with st.sidebar:
     selected_hours = [0 if h == 24 else h for h in selected_ui]
 
     col1, col2 = st.columns(2)
-    run_btn = col1.button("🚀 실행", width="stretch")          # ✅ 변경
-    clear_btn = col2.button("🧹 결과 초기화", width="stretch") # ✅ 변경
+    run_btn = col1.button("🚀 실행", width="stretch")
+    clear_btn = col2.button("🧹 결과 초기화", width="stretch")
 
     st.divider()
     st.markdown(
@@ -401,7 +403,7 @@ zip_upload = st.file_uploader(
 
 use_latest_zip = st.checkbox("방금 생성된 ZIP으로 Summary 만들기", value=False)
 
-if st.button("📌 Summary 생성하기", width="stretch"):  # ✅ 변경
+if st.button("📌 Summary 생성하기", width="stretch"):
     try:
         if use_latest_zip:
             if st.session_state.get("zip_bytes") is None:
@@ -430,3 +432,59 @@ if st.button("📌 Summary 생성하기", width="stretch"):  # ✅ 변경
 
     except Exception as e:
         st.error(f"Summary 생성 실패: {e}")
+
+
+# =========================
+# ✅ Dashboard 생성 (ZIP or 개별 Summary 업로드)
+# =========================
+st.divider()
+st.subheader("Dashboard 생성 (여러 일자 Summary 묶음)")
+
+st.caption(
+    "✅ 방법 A) 여러 날짜 Summary 파일들을 폴더에 모아 zip으로 압축해 업로드\n"
+    "✅ 방법 B) Summary 엑셀들을 개별로 여러 개 직접 업로드"
+)
+
+dash_zip = st.file_uploader(
+    "방법 A) Summary 폴더 ZIP 업로드(선택)",
+    type=["zip"],
+    key="zip_uploader_for_dashboard"
+)
+
+dash_files = st.file_uploader(
+    "방법 B) Summary 엑셀 여러 개 업로드(선택)",
+    type=["xlsx"],
+    accept_multiple_files=True,
+    key="xlsx_uploader_for_dashboard"
+)
+
+if st.button("📊 Dashboard 생성하기", width="stretch"):
+    try:
+        if dash_zip is not None:
+            zip_bytes = dash_zip.getbuffer()
+            zip_name = dash_zip.name
+
+            with st.spinner("Dashboard 생성 중...(ZIP)"):
+                dash_name, dash_bytes = build_dashboard_from_zip_bytes(zip_bytes, zip_name)
+
+        elif dash_files:
+            file_bytes_list = [(f.name, f.getbuffer()) for f in dash_files]
+
+            with st.spinner("Dashboard 생성 중...(엑셀 개별)"):
+                dash_name, dash_bytes = build_dashboard_from_file_bytes(file_bytes_list)
+
+        else:
+            st.error("ZIP 또는 Summary 엑셀 파일들을 업로드하세요.")
+            st.stop()
+
+        st.success("Dashboard 생성 완료!")
+        st.download_button(
+            "⬇️ Dashboard 다운로드",
+            data=dash_bytes,
+            file_name=dash_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl-dashboard"
+        )
+
+    except Exception as e:
+        st.error(f"Dashboard 생성 실패: {e}")
