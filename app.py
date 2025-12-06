@@ -61,11 +61,12 @@ def find_logo_path():
 
 logo_path_found = find_logo_path()
 
+
 # =========================
 # 날짜 추출 유틸 (YY.MM.DD 또는 MM.DD 둘 다 지원)
 # =========================
-_DATE_RE_YYMMDD = re.compile(r"(\d{2})\.(\d{2})\.(\d{2})")  # 25.12.01
-_DATE_RE_MMDD   = re.compile(r"(?<!\d)(\d{1,2})\.(\d{2})(?!\d)")  # 12.01 / 8.01
+_DATE_RE_YYMMDD = re.compile(r"(\d{2})\.(\d{2})\.(\d{2})")            # 25.12.01
+_DATE_RE_MMDD   = re.compile(r"(?<!\d)(\d{1,2})\.(\d{2})(?!\d)")     # 12.01 / 8.01
 
 def extract_mmdd(text: str):
     """
@@ -96,20 +97,17 @@ def extract_mmdd_from_sources(raw_files=None, raw_zip_name=None, extracted_names
     2) 업로드 raw xlsx 파일명에서
     3) zip 내부 xlsx 파일명에서
     """
-    # 1) zip 이름
     if raw_zip_name:
         mmdd = extract_mmdd(raw_zip_name)
         if mmdd:
             return mmdd
 
-    # 2) 업로드 xlsx 이름들
     if raw_files:
         for rf in raw_files:
             mmdd = extract_mmdd(rf.name)
             if mmdd:
                 return mmdd
 
-    # 3) zip 내부 파일명들
     if extracted_names:
         for name in extracted_names:
             mmdd = extract_mmdd(name)
@@ -117,6 +115,7 @@ def extract_mmdd_from_sources(raw_files=None, raw_zip_name=None, extracted_names
                 return mmdd
 
     return None
+
 
 # =========================
 # 세션 상태
@@ -171,7 +170,7 @@ with col_title:
     st.caption("KHD/WPH 원본을 파싱해 Lane1/2 Result를 템플릿 기반으로 자동 생성합니다.")
 with col_logo:
     if logo_path_found:
-        st.image(logo_path_found, use_container_width=True)
+        st.image(logo_path_found, width="stretch")   # ✅ use_container_width 제거
     else:
         st.caption("⚠️ logo.png 없음")
 
@@ -232,8 +231,8 @@ with st.sidebar:
     selected_hours = [0 if h == 24 else h for h in selected_ui]
 
     col1, col2 = st.columns(2)
-    run_btn = col1.button("🚀 실행", use_container_width=True)
-    clear_btn = col2.button("🧹 결과 초기화", use_container_width=True)
+    run_btn = col1.button("🚀 실행", width="stretch")          # ✅ 변경
+    clear_btn = col2.button("🧹 결과 초기화", width="stretch") # ✅ 변경
 
     st.divider()
     st.markdown(
@@ -305,7 +304,7 @@ if run_btn:
 
             templates = {"KHD": final_khd_tpl, "WPH": final_wph_tpl}
 
-            # ✅ raw 입력을 실제 파일 경로 리스트로 통일
+            # raw 입력을 실제 파일 경로 리스트로 통일
             raw_paths = []
             extracted_names = []
 
@@ -320,7 +319,7 @@ if run_btn:
                 st.error("ZIP 안에 xlsx가 없습니다. 압축 구조를 확인해줘.")
                 st.stop()
 
-            # ✅ 날짜 기반 ZIP 네이밍
+            # 날짜 기반 ZIP 네이밍
             mmdd = extract_mmdd_from_sources(
                 raw_files=raw_files,
                 raw_zip_name=(raw_zip.name if raw_zip else None),
@@ -402,7 +401,7 @@ zip_upload = st.file_uploader(
 
 use_latest_zip = st.checkbox("방금 생성된 ZIP으로 Summary 만들기", value=False)
 
-if st.button("📌 Summary 생성하기", use_container_width=True):
+if st.button("📌 Summary 생성하기", width="stretch"):  # ✅ 변경
     try:
         if use_latest_zip:
             if st.session_state.get("zip_bytes") is None:
