@@ -1,394 +1,455 @@
-import streamlit as st
-import tempfile
+# app.py
+# Streamlit UI: 원본 → (Validation + 4개 미리보기 + 추천 시간필터 적용) → Result ZIP 생성 → Summary → Dashboard
+
+import io
 import os
 import zipfile
-import re
-from pathlib import Path
+import tempfile
+from datetime import datetime
 
-from engine import make_results_for_input
+import streamlit as st
+import openpyxl
+import pandas as pd
+
+import engine
 from summary_engine import build_from_zip_bytes
 from dashboard_engine import (
     build_dashboard_from_zip_bytes,
-    build_dashboard_from_file_bytes
+    build_dashboard_from_file_bytes,
 )
 
-st.set_page_config(page_title="SLB MES Result Maker", layout="wide")
+from ui_error import show_error, run_with_ui_error
+from validator import pre_validate
 
 
-# =========================================================
-# 0) 비밀번호 게이트 (Secrets 기반)
-# =========================================================
-DEFAULT_PASSWORD = st.secrets.get("APP_PASSWORD", "")
-if not DEFAULT_PASSWORD:
-    st.error("관리자에게 비밀번호 설정(Secrets)을 요청하세요.")
+# ---------------------------
+# App Config / Password Gate
+# ---------------------------
+st.set_page_config(page_title="SLB MES Result Generator", layout="wide")
+
+APP_TITLE = "SLB MES Result Generator"
+st.title(APP_TITLE)
+
+if "APP_PASSWORD" not in st.secrets:
+    st.error("APP_PASSWORD가 설정되지 않았습니다. Streamlit secrets를 확인하세요.")
     st.stop()
 
 if "authed" not in st.session_state:
-    st.session_state["authed"] = False
+    st.session_state.authed = False
 
-if not st.session_state["authed"]:
-    st.title("SLB MES Result Maker 🔒")
-    st.caption("접근하려면 비밀번호를 입력하세요.")
-    pw = st.text_input("Password", type="password")
-    if pw == DEFAULT_PASSWORD:
-        st.session_state["authed"] = True
-        st.rerun()
-    else:
-        st.stop()
-
-
-# =========================
-# 경로 설정
-# =========================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_KHD_TPL = os.path.join(APP_DIR, "templates", "TEMPLATE_KHD.xlsx")
-DEFAULT_WPH_TPL = os.path.join(APP_DIR, "templates", "TEMPLATE_WPH.xlsx")
-
-
-# =========================
-# 로고 찾기
-# =========================
-def find_logo_path():
-    exts = ["png", "jpg", "jpeg"]
-    search_dirs = [
-        Path(APP_DIR) / "assets",
-        Path(os.getcwd()) / "assets",
-    ]
-    for d in search_dirs:
-        for ext in exts:
-            p = d / f"logo.{ext}"
-            if p.exists():
-                return str(p)
-    return None
-
-logo_path_found = find_logo_path()
-
-
-# =========================
-# 날짜 추출 유틸 (YY.MM.DD 또는 MM.DD 둘 다 지원)
-# =========================
-_DATE_RE_YYMMDD = re.compile(r"(\d{2})\.(\d{2})\.(\d{2})")            # 25.12.01
-_DATE_RE_MMDD   = re.compile(r"(?<!\d)(\d{1,2})\.(\d{2})(?!\d)")     # 12.01 / 8.01
-
-def extract_mmdd(text: str):
-    text = text or ""
-
-    m = _DATE_RE_YYMMDD.search(text)
-    if m:
-        _, mm, dd = m.groups()
-        return f"{mm}.{dd}"
-
-    m = _DATE_RE_MMDD.search(text)
-    if m:
-        mm, dd = m.groups()
-        mm = mm.zfill(2)
-        return f"{mm}.{dd}"
-
-    return None
-
-
-def extract_mmdd_from_sources(raw_files=None, raw_zip_name=None, extracted_names=None):
-    if raw_zip_name:
-        mmdd = extract_mmdd(raw_zip_name)
-        if mmdd:
-            return mmdd
-
-    if raw_files:
-        for rf in raw_files:
-            mmdd = extract_mmdd(rf.name)
-            if mmdd:
-                return mmdd
-
-    if extracted_names:
-        for name in extracted_names:
-            mmdd = extract_mmdd(name)
-            if mmdd:
-                return mmdd
-
-    return None
-
-
-# =========================
-# 세션 상태
-# =========================
-if "results" not in st.session_state:
-    st.session_state["results"] = []
-if "zip_bytes" not in st.session_state:
-    st.session_state["zip_bytes"] = None
-if "zip_filename" not in st.session_state:
-    st.session_state["zip_filename"] = None
-
-
-def safe_read_bytes(path: Path, retries: int = 2):
-    last_err = None
-    for _ in range(retries + 1):
-        try:
-            with open(path, "rb") as f:
-                return f.read()
-        except PermissionError as e:
-            last_err = e
-    raise last_err
-
-
-def save_uploaded_to_temp(uploaded_file, tmp_dir: Path):
-    fname = Path(uploaded_file.name).name
-    out_path = tmp_dir / fname
-    data = uploaded_file.getvalue()  # ✅ Cloud-safe
-    with open(out_path, "wb") as f:
-        f.write(data)
-    return str(out_path)
-
-
-def extract_raw_zip_to_paths(raw_zip_file, tmp_dir: Path):
-    zip_path = Path(save_uploaded_to_temp(raw_zip_file, tmp_dir))
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(tmp_dir)
-
-    return [str(p) for p in tmp_dir.rglob("*.xlsx")]
-
-
-# =========================
-# 헤더(타이틀 + 로고)
-# =========================
-col_title, col_logo = st.columns([5, 1], vertical_alignment="center")
-with col_title:
-    st.title("SLB MES 결과 생성기")
-    st.caption("KHD/WPH 원본을 파싱해 Lane1/2 Result를 템플릿 기반으로 자동 생성합니다.")
-with col_logo:
-    if logo_path_found:
-        st.image(logo_path_found, width="stretch")
-    else:
-        st.caption("⚠️ logo.png 없음")
-
-
-# =========================
-# 사이드바 UI
-# =========================
 with st.sidebar:
-    st.header("STEP 1) 원본 파일 선택")
+    st.header("접속")
+    if not st.session_state.authed:
+        pw = st.text_input("비밀번호", type="password")
+        if st.button("로그인", use_container_width=True):
+            if pw == st.secrets["APP_PASSWORD"]:
+                st.session_state.authed = True
+                st.success("로그인 성공")
+            else:
+                st.error("비밀번호가 올바르지 않습니다.")
+    else:
+        st.success("인증됨")
+        if st.button("로그아웃", use_container_width=True):
+            st.session_state.authed = False
+            st.rerun()
 
-    st.caption("✅ 방법 A) KHD/WPH 원본 xlsx 여러 개 업로드")
-    raw_files = st.file_uploader(
-        "KHD/WPH 원본 (.xlsx) - 복수 선택 가능",
+if not st.session_state.authed:
+    st.stop()
+
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def _now_mmdd() -> str:
+    return datetime.now().strftime("%m.%d")
+
+
+def _zip_bytes_from_folder(folder_path: str, zip_name: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(folder_path):
+            for f in files:
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, folder_path)
+                zf.write(full, rel)
+    return buf.getvalue()
+
+
+def _collect_input_files(uploaded_files, uploaded_zip) -> list[tuple[str, bytes]]:
+    items: list[tuple[str, bytes]] = []
+    if uploaded_zip is not None:
+        z = zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()))
+        for n in z.namelist():
+            if n.lower().endswith(".xlsx") and not n.startswith("__MACOSX/"):
+                items.append((os.path.basename(n), z.read(n)))
+        return items
+
+    if uploaded_files:
+        for uf in uploaded_files:
+            items.append((uf.name, uf.getvalue()))
+    return items
+
+
+def _try_copy_default(src: str, dst: str) -> None:
+    try:
+        if os.path.exists(src):
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                fdst.write(fsrc.read())
+    except Exception:
+        pass
+
+
+def _prepare_templates_on_temp(
+    default_khd: str,
+    default_wph: str,
+    tpl_khd_upload,
+    tpl_wph_upload,
+    tmp_root_prefix: str,
+) -> dict[str, str]:
+    tmp_root = tempfile.mkdtemp(prefix=tmp_root_prefix)
+    tpl_dir = os.path.join(tmp_root, "templates")
+    os.makedirs(tpl_dir, exist_ok=True)
+
+    khd_path = os.path.join(tpl_dir, "TEMPLATE_KHD.xlsx")
+    wph_path = os.path.join(tpl_dir, "TEMPLATE_WPH.xlsx")
+
+    _try_copy_default(default_khd, khd_path)
+    _try_copy_default(default_wph, wph_path)
+
+    if tpl_khd_upload is not None:
+        with open(khd_path, "wb") as f:
+            f.write(tpl_khd_upload.getvalue())
+
+    if tpl_wph_upload is not None:
+        with open(wph_path, "wb") as f:
+            f.write(tpl_wph_upload.getvalue())
+
+    return {"KHD": khd_path, "WPH": wph_path}
+
+
+def _get_template_sheetnames(templates: dict[str, str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for dtype, path in templates.items():
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        out[dtype] = wb.sheetnames
+        wb.close()
+    return out
+
+
+def _parse_selected_hours(selected_labels: list[int]) -> list[int]:
+    # UI label 1..24 -> engine hour 0..23
+    out = []
+    for v in selected_labels:
+        out.append(0 if v == 24 else int(v))
+    return sorted(set(out))
+
+
+def _hours_to_labels(hours: list[int]) -> list[int]:
+    return [24 if h == 0 else h for h in hours]
+
+
+# ---------------------------
+# Session State defaults
+# ---------------------------
+st.session_state.setdefault("zip_bytes", None)
+st.session_state.setdefault("zip_filename", None)
+
+st.session_state.setdefault("validation_result", None)
+st.session_state.setdefault("validation_ok", False)
+
+# 시간 multiselect는 key 기반으로 제어(추천 적용 버튼에서 값 변경)
+hour_labels = list(range(1, 25))
+st.session_state.setdefault("hour_filter", hour_labels[:])  # 최초 기본은 전체
+
+
+# ---------------------------
+# Section 1: Result 생성
+# ---------------------------
+st.subheader("1) Result 생성 (원본 → Lane별 Result 엑셀 → ZIP)")
+
+colA, colB = st.columns([2, 1], gap="large")
+
+with colA:
+    st.markdown("### 입력")
+    uploaded_files = st.file_uploader(
+        "원본 MES 엑셀(.xlsx) 여러 개 업로드",
         type=["xlsx"],
         accept_multiple_files=True,
-        key="raw_xlsx_uploader"
+        key="uploader_xlsx_multi",
     )
-
-    st.caption("✅ 방법 B) KHD+WPH가 들어있는 폴더를 zip으로 압축해 1개 업로드")
-    raw_zip = st.file_uploader(
-        "원본 폴더 ZIP(선택)",
+    uploaded_zip = st.file_uploader(
+        "또는 원본 폴더를 ZIP으로 업로드 (.zip 안에 .xlsx 포함)",
         type=["zip"],
         accept_multiple_files=False,
-        key="raw_zip_uploader"
+        key="uploader_xlsx_zip",
     )
 
-    st.divider()
-    st.header("STEP 2) 템플릿 (기본 자동 사용)")
-    st.caption("기본 템플릿은 관리자(강경민) 관리 버전이 자동 적용됩니다.")
-    st.write("기본 KHD 템플릿:", os.path.basename(DEFAULT_KHD_TPL))
-    st.write("기본 WPH 템플릿:", os.path.basename(DEFAULT_WPH_TPL))
+with colB:
+    st.markdown("### 템플릿")
+    default_khd = "templates/TEMPLATE_KHD.xlsx"
+    default_wph = "templates/TEMPLATE_WPH.xlsx"
 
-    with st.expander("템플릿을 직접 바꾸고 싶다면(옵션)", expanded=False):
-        tpl_khd = st.file_uploader("KHD 템플릿 업로드(선택)", type=["xlsx"], key="tpl_khd")
-        tpl_wph = st.file_uploader("WPH 템플릿 업로드(선택)", type=["xlsx"], key="tpl_wph")
-        st.caption("업로드하면 해당 템플릿이 기본 템플릿보다 우선 적용됩니다.")
+    tpl_khd_upload = st.file_uploader("KHD 템플릿 업로드(선택)", type=["xlsx"], key="tpl_khd")
+    tpl_wph_upload = st.file_uploader("WPH 템플릿 업로드(선택)", type=["xlsx"], key="tpl_wph")
 
-    st.divider()
-    st.header("STEP 3) 옵션")
+    st.markdown("### 옵션")
     raw_end_row = st.number_input(
-        "Raw 끝행(차트 참조 범위 끝)",
-        min_value=50, max_value=500, value=100, step=10,
-        help="템플릿 차트가 참조하는 Raw 데이터의 마지막 행"
+        "Raw 끝행(raw_end_row)",
+        min_value=20,
+        max_value=5000,
+        value=100,
+        step=10,
+        help="템플릿 차트가 참조하는 Raw 데이터 영역의 마지막 행",
     )
 
-    st.subheader("시간 필터(선택)")
-    st.caption("선택한 시간만 결과/그래프에 포함됩니다. 비워두면 전체 자동 포함.")
-
-    hour_options = list(range(0, 24))
-    hour_labels_ui = [24 if h == 0 else h for h in hour_options]
-
-    selected_ui = st.multiselect(
-        "포함할 시간 선택",
-        options=hour_labels_ui,
-        default=[],
-        help="예: 8,9,10만 선택하면 그 시간만 결과에 표시"
+    # key="hour_filter" 로 session_state 직접 제어
+    st.multiselect(
+        "시간 필터(선택한 시간대만 반영)",
+        options=hour_labels,
+        key="hour_filter",
+        help="24는 자정(00시)로 처리됩니다.",
     )
-    selected_hours = [0 if h == 24 else h for h in selected_ui]
+    selected_labels = st.session_state["hour_filter"]
+    selected_hours = _parse_selected_hours(selected_labels)
 
-    col1, col2 = st.columns(2)
-    run_btn = col1.button("🚀 실행", width="stretch", key="btn-run")
-    clear_btn = col2.button("🧹 결과 초기화", width="stretch", key="btn-clear")
+# ---------------------------
+# Validation + 4개 미리보기 + 추천 적용
+# ---------------------------
+st.markdown("### 사전 점검 + 미리보기 (ZIP 만들기 전)")
 
-    st.divider()
-    st.markdown(
-        "<div style='font-size:12px;color:gray;text-align:right;'>BYKKM</div>",
-        unsafe_allow_html=True
-    )
+validate_btn = st.button("🔍 사전 점검 실행", use_container_width=True, key="btn_validate")
 
-
-# =========================
-# 결과 초기화
-# =========================
-if clear_btn:
-    st.session_state["results"] = []
-    st.session_state["zip_bytes"] = None
-    st.session_state["zip_filename"] = None
-    st.success("결과를 초기화했습니다. 다시 실행하세요.")
-
-
-# =========================
-# 메인 화면
-# =========================
-left, right = st.columns([1.2, 1])
-
-with left:
-    st.subheader("현재 선택된 원본")
-    if raw_zip:
-        st.write(f"- ZIP: {raw_zip.name} ({raw_zip.size/1024/1024:.1f} MB)")
-    if raw_files:
-        for rf in raw_files:
-            st.write(f"- {rf.name} ({rf.size/1024/1024:.1f} MB)")
-    if not raw_zip and not raw_files:
-        st.info("왼쪽에서 원본 xlsx 또는 원본 폴더 ZIP을 선택하세요.")
-
-with right:
-    st.subheader("템플릿 적용 상태")
-    st.write("✅ KHD 템플릿:",
-             "기본 사용" if st.session_state.get("tpl_khd") is None else "사용자 업로드")
-    st.write("✅ WPH 템플릿:",
-             "기본 사용" if st.session_state.get("tpl_wph") is None else "사용자 업로드")
-    st.write("Raw 끝행:", raw_end_row)
-
-st.divider()
-
-
-# =========================
-# 실행
-# =========================
-if run_btn:
-    if (not raw_files) and (raw_zip is None):
-        st.error("원본 xlsx 또는 원본 폴더 ZIP을 하나 이상 선택해줘.")
-        st.stop()
-
-    if not os.path.exists(DEFAULT_KHD_TPL) or not os.path.exists(DEFAULT_WPH_TPL):
-        st.error("기본 템플릿을 찾을 수 없습니다. templates 폴더 구성을 확인하세요.")
-        st.stop()
-
-    with st.spinner("파싱 및 결과 생성 중..."):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            tmp_dir = Path(tmp)
-
-            final_khd_tpl = DEFAULT_KHD_TPL
-            final_wph_tpl = DEFAULT_WPH_TPL
-
-            if st.session_state.get("tpl_khd") is not None:
-                final_khd_tpl = save_uploaded_to_temp(st.session_state["tpl_khd"], tmp_dir)
-            if st.session_state.get("tpl_wph") is not None:
-                final_wph_tpl = save_uploaded_to_temp(st.session_state["tpl_wph"], tmp_dir)
-
-            templates = {"KHD": final_khd_tpl, "WPH": final_wph_tpl}
-
-            raw_paths = []
-            extracted_names = []
-
-            if raw_zip is not None:
-                raw_paths = extract_raw_zip_to_paths(raw_zip, tmp_dir)
-                extracted_names = [Path(p).name for p in raw_paths]
-            else:
-                for rf in raw_files:
-                    raw_paths.append(save_uploaded_to_temp(rf, tmp_dir))
-
-            if not raw_paths:
-                st.error("ZIP 안에 xlsx가 없습니다. 압축 구조를 확인해줘.")
-                st.stop()
-
-            mmdd = extract_mmdd_from_sources(
-                raw_files=raw_files,
-                raw_zip_name=(raw_zip.name if raw_zip else None),
-                extracted_names=extracted_names
-            )
-            zip_base = f"SLB_MES_Result_Package_{mmdd}" if mmdd else "SLB_MES_Result_Package"
-            zip_filename = f"{zip_base}.zip"
-
-            created_paths = []
-            for raw_path in raw_paths:
-                created = make_results_for_input(
-                    raw_path,
-                    templates=templates,
-                    output_dir=str(tmp_dir),
-                    raw_end_row=raw_end_row,
-                    selected_hours=selected_hours
-                )
-                created_paths.extend(created)
-
-            all_created_bytes = []
-            for p in created_paths:
-                p_path = Path(p)
-                data = safe_read_bytes(p_path)
-                all_created_bytes.append((p_path.name, data))
-
-            zip_path = tmp_dir / zip_filename
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for p in created_paths:
-                    zf.write(p, arcname=Path(p).name)
-
-            zip_bytes = safe_read_bytes(zip_path)
-
-            st.session_state["results"] = all_created_bytes
-            st.session_state["zip_bytes"] = zip_bytes
-            st.session_state["zip_filename"] = zip_filename
-
-    st.success("완료! 아래에서 결과 파일을 다운로드하세요.")
-
-
-# =========================
-# 결과 표시
-# =========================
-if st.session_state["results"]:
-    st.subheader("개별 결과 파일")
-    for i, (filename, data) in enumerate(st.session_state["results"]):
-        st.download_button(
-            label=f"⬇️ {filename}",
-            data=data,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"dl-{i}-{filename}"
-        )
-
-    st.subheader("전체 ZIP")
-    zip_name_for_dl = st.session_state.get("zip_filename", "SLB_MES_Result_Package.zip")
-    st.download_button(
-        label="⬇️ 전체 결과 ZIP 다운로드",
-        data=st.session_state["zip_bytes"],
-        file_name=zip_name_for_dl,
-        mime="application/zip",
-        key="dl-zip"
-    )
-else:
-    st.info("원본을 선택하고 실행을 누르면 결과가 표시됩니다.")
-
-
-# =========================
-# Deviation Summary 생성(Zip 기반)
-# =========================
-st.divider()
-st.subheader("Deviation Summary 생성")
-
-zip_upload = st.file_uploader(
-    "기존 SLB_MES_Result_Package_XX.XX.zip을 업로드하면 Summary를 생성합니다.",
-    type=["zip"],
-    key="zip_uploader_for_summary"
-)
-
-if st.button("📌 Summary 생성하기", width="stretch", key="btn-build-summary"):
+if validate_btn:
     try:
-        if zip_upload is None:
-            st.error("Summary를 만들 ZIP 파일을 업로드하세요.")
+        inputs = _collect_input_files(uploaded_files, uploaded_zip)
+        if not inputs:
+            st.warning("원본 엑셀(.xlsx) 파일을 업로드하거나 ZIP을 업로드하세요.")
             st.stop()
 
-        zip_bytes = zip_upload.getvalue()
-        zip_name = zip_upload.name
+        templates_for_validation = _prepare_templates_on_temp(
+            default_khd=default_khd,
+            default_wph=default_wph,
+            tpl_khd_upload=tpl_khd_upload,
+            tpl_wph_upload=tpl_wph_upload,
+            tmp_root_prefix="mes_validate_",
+        )
+        template_sheetnames = _get_template_sheetnames(templates_for_validation)
+
+        with st.spinner("사전 점검 중..."):
+            vr = pre_validate(
+                input_files=inputs,
+                template_sheetnames=template_sheetnames,
+                selected_hours=selected_hours,
+                low_count_threshold=3,
+            )
+
+        st.session_state["validation_result"] = vr
+        st.session_state["validation_ok"] = bool(vr.get("ok", False))
+
+    except Exception as e:
+        st.session_state["validation_result"] = None
+        st.session_state["validation_ok"] = False
+        show_error(e)
+
+vr = st.session_state.get("validation_result")
+if vr:
+    if vr.get("ok"):
+        st.success("사전 점검 통과! (치명 에러 없음)")
+    else:
+        st.error("사전 점검 실패: 에러를 해결해야 Result를 생성할 수 있습니다.")
+
+    # 치명 에러
+    if vr.get("errors"):
+        st.markdown("#### ❌ 에러(해결 필요)")
+        for e in vr["errors"]:
+            show_error(e)
+
+    # 참고 경고
+    if vr.get("warnings"):
+        st.markdown("#### ⚠️ 경고(그래프/데이터 이상 가능성)")
+        for w in vr["warnings"][:200]:
+            st.warning(w)
+
+    # 전역 추천 제외 시간(공백 시간 기준)
+    rec = vr.get("recommend_global", {})
+    exclude_labels = rec.get("exclude_labels", [])
+
+    cols = st.columns([2, 1])
+    with cols[0]:
+        st.info(
+            "추천 제외 시간(1시간 버킷 데이터 0개 기준): "
+            + (", ".join(f"{h:02d}" for h in exclude_labels) if exclude_labels else "없음")
+        )
+    with cols[1]:
+        if st.button("✅ 추천 시간 제외 적용(원클릭)", use_container_width=True, key="btn_apply_reco"):
+            # 현재 선택에서 추천 제외 시간을 제거
+            cur = set(st.session_state["hour_filter"])
+            new = sorted(list(cur - set(exclude_labels)))
+            st.session_state["hour_filter"] = new if new else st.session_state["hour_filter"]
+            st.rerun()
+
+    # 파일별 4개 미리보기 (KHD/WPH x 1Lane/2Lane)
+    st.markdown("#### 👀 4개 결과 미리보기 (대표 item 1개씩)")
+
+    by_file = vr.get("by_file", {})
+    for fname, pack in by_file.items():
+        with st.expander(f"📄 {fname} 미리보기", expanded=True):
+            previews = pack.get("previews", {})
+
+            # 2x2 배치: (KHD 1Lane, KHD 2Lane, WPH 1Lane, WPH 2Lane)
+            order = [("KHD", "1Lane"), ("KHD", "2Lane"), ("WPH", "1Lane"), ("WPH", "2Lane")]
+            c1, c2 = st.columns(2, gap="large")
+            slot_cols = [c1, c2, c1, c2]
+
+            for idx, key in enumerate(order):
+                dtype, lane = key
+                col = slot_cols[idx]
+                with col:
+                    data = previews.get((dtype, lane))
+                    if not data:
+                        st.warning(f"{dtype} {lane}: 데이터 없음(또는 dtype 감지 실패)")
+                        continue
+
+                    st.markdown(f"**{dtype} {lane}**")
+                    st.caption(f"대표 item: {data['item']}")
+                    st.caption(f"기간: {data['date_range']} / parse OK: {data['parse_ok']:.0%}")
+
+                    miss = data.get("missing_hours", [])
+                    low = data.get("low_hours", [])
+
+                    if miss:
+                        st.error(f"1시간 공백(데이터 0개): {', '.join(f'{h:02d}' for h in _hours_to_labels(miss))}")
+                    else:
+                        st.success("1시간 공백 없음")
+
+                    if low:
+                        st.warning(f"샘플 수 부족(<3): {', '.join(f'{h:02d}' for h in _hours_to_labels(low))}")
+
+                    # 시간별 AVG 라인차트(대표 item)
+                    s = pd.Series(data["hourly_avg_series"])
+                    # 보기 좋게 라벨을 1..24 -> 01..24로 바꿔 표시(값은 그대로)
+                    s.index = [f"{i:02d}" for i in range(1, 25)]
+                    st.line_chart(s)
+
+            if vr.get("summary_rows"):
+                st.markdown("##### 📋 요약 테이블")
+                # 해당 파일 row만
+                rows = [r for r in vr["summary_rows"] if r.get("File") == fname]
+                if rows:
+                    st.dataframe(rows, use_container_width=True)
+
+# ---------------------------
+# Result 생성 버튼(Validation 통과 시 활성)
+# ---------------------------
+make_btn = st.button(
+    "✅ Result ZIP 생성하기",
+    use_container_width=True,
+    disabled=not st.session_state.get("validation_ok", False),
+)
+
+if make_btn:
+    if not st.session_state.get("validation_ok", False):
+        st.warning("먼저 사전 점검을 실행하고, 통과한 뒤 Result를 생성하세요.")
+        st.stop()
+
+    inputs = _collect_input_files(uploaded_files, uploaded_zip)
+    if not inputs:
+        st.warning("원본 엑셀(.xlsx) 파일을 업로드하거나 ZIP을 업로드하세요.")
+        st.stop()
+
+    templates = _prepare_templates_on_temp(
+        default_khd=default_khd,
+        default_wph=default_wph,
+        tpl_khd_upload=tpl_khd_upload,
+        tpl_wph_upload=tpl_wph_upload,
+        tmp_root_prefix="mes_run_",
+    )
+
+    tmp_root = tempfile.mkdtemp(prefix="mes_run_")  # 결과/입력 저장용
+    out_dir = os.path.join(tmp_root, "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _run_make():
+        created_all: list[str] = []
+        for fname, fbytes in inputs:
+            in_path = os.path.join(tmp_root, "inputs", fname)
+            os.makedirs(os.path.dirname(in_path), exist_ok=True)
+            with open(in_path, "wb") as f:
+                f.write(fbytes)
+
+            created = engine.make_results_for_input(
+                input_path=in_path,
+                templates=templates,
+                output_dir=out_dir,
+                raw_end_row=int(raw_end_row),
+                selected_hours=_parse_selected_hours(st.session_state["hour_filter"]),
+            )
+            created_all.extend(created)
+
+        if not created_all:
+            raise Exception("생성된 결과 파일이 없습니다.")
+        return created_all
+
+    created_files = run_with_ui_error(_run_make, spinner_text="Result 생성 중...")
+    if created_files is None:
+        st.stop()
+
+    zip_name = f"SLB_MES_Result_Package_{_now_mmdd()}.zip"
+    zip_bytes = _zip_bytes_from_folder(out_dir, zip_name)
+
+    st.session_state["zip_bytes"] = zip_bytes
+    st.session_state["zip_filename"] = zip_name
+
+    st.success("Result ZIP 생성 완료!")
+    st.download_button(
+        "⬇️ Result ZIP 다운로드",
+        data=zip_bytes,
+        file_name=zip_name,
+        mime="application/zip",
+        use_container_width=True,
+        key="dl-result-zip",
+    )
+
+    with st.expander("생성된 파일 목록"):
+        for p in created_files:
+            st.write("-", os.path.basename(p))
+
+
+# ---------------------------
+# Section 2: Deviation Summary 생성
+# ---------------------------
+st.divider()
+st.subheader("2) Deviation Summary 생성 (Result ZIP → Summary 엑셀)")
+
+has_last_zip = bool(st.session_state.get("zip_bytes"))
+
+use_last = st.checkbox(
+    "바로 이전에 생성한 Result ZIP으로 Summary 만들기(업로드 없이)",
+    value=has_last_zip,
+    disabled=not has_last_zip,
+)
+
+zip_upload_for_summary = None
+if not use_last:
+    zip_upload_for_summary = st.file_uploader(
+        "기존 SLB_MES_Result_Package_XX.XX.zip 업로드",
+        type=["zip"],
+        key="uploader_summary_zip",
+    )
+else:
+    st.info(f"직전 결과 사용: {st.session_state.get('zip_filename', 'results.zip')}")
+
+if st.button("📌 Summary 생성하기", use_container_width=True, key="btn_summary"):
+    try:
+        if use_last:
+            zip_bytes = st.session_state["zip_bytes"]
+            zip_name = st.session_state.get("zip_filename", "results.zip")
+        else:
+            if zip_upload_for_summary is None:
+                st.warning("Summary를 만들 ZIP 파일을 업로드하세요.")
+                st.stop()
+            zip_bytes = zip_upload_for_summary.getvalue()
+            zip_name = zip_upload_for_summary.name
 
         with st.spinner("Summary 생성 중..."):
             summary_name, summary_bytes = build_from_zip_bytes(zip_bytes, zip_name)
@@ -399,55 +460,58 @@ if st.button("📌 Summary 생성하기", width="stretch", key="btn-build-summar
             data=summary_bytes,
             file_name=summary_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl-summary"
+            use_container_width=True,
+            key="dl-summary",
         )
 
     except Exception as e:
-        st.error(f"Summary 생성 실패: {e}")
+        show_error(e)
 
 
-# =========================
-# Dashboard 생성 (ZIP or 개별 Summary 업로드)
-# =========================
+# ---------------------------
+# Section 3: Dashboard 생성
+# ---------------------------
 st.divider()
-st.subheader("Dashboard 생성 (여러 일자 Summary 묶음)")
+st.subheader("3) Dashboard 생성 (Summary 여러 개 → 기간 Dashboard 엑셀)")
 
-st.caption(
-    "✅ 방법 A) 여러 날짜 Summary 파일들을 폴더에 모아 zip으로 압축해 업로드\n"
-    "✅ 방법 B) Summary 엑셀들을 개별로 여러 개 직접 업로드"
+dash_mode = st.radio(
+    "입력 방식",
+    options=["Summary ZIP 업로드", "Summary 파일 여러 개 업로드"],
+    horizontal=True,
+    key="dash_mode",
 )
 
-dash_zip = st.file_uploader(
-    "방법 A) Summary 폴더 ZIP 업로드(선택)",
-    type=["zip"],
-    key="zip_uploader_for_dashboard"
-)
+dash_zip = None
+dash_files = None
 
-dash_files = st.file_uploader(
-    "방법 B) Summary 엑셀 여러 개 업로드(선택)",
-    type=["xlsx", "xlsm"],
-    accept_multiple_files=True,
-    key="xlsx_uploader_for_dashboard"
-)
+if dash_mode == "Summary ZIP 업로드":
+    dash_zip = st.file_uploader(
+        "Summary 엑셀들이 들어있는 ZIP 업로드",
+        type=["zip"],
+        key="uploader_dash_zip",
+    )
+else:
+    dash_files = st.file_uploader(
+        "Summary 엑셀(.xlsx) 여러 개 업로드",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="uploader_dash_files",
+    )
 
-if st.button("📊 Dashboard 생성하기", width="stretch", key="btn-build-dashboard"):
+if st.button("📊 Dashboard 생성하기", use_container_width=True, key="btn_dash"):
     try:
-        if dash_zip is not None:
-            zip_bytes = dash_zip.getvalue()
-            zip_name = dash_zip.name
-
-            with st.spinner("Dashboard 생성 중...(ZIP)"):
-                dash_name, dash_bytes = build_dashboard_from_zip_bytes(zip_bytes, zip_name)
-
-        elif dash_files:
-            file_bytes_list = [(f.name, f.getvalue()) for f in dash_files]
-
-            with st.spinner("Dashboard 생성 중...(엑셀 개별)"):
-                dash_name, dash_bytes = build_dashboard_from_file_bytes(file_bytes_list)
-
-        else:
-            st.error("ZIP 또는 Summary 엑셀 파일들을 업로드하세요.")
-            st.stop()
+        with st.spinner("Dashboard 생성 중..."):
+            if dash_mode == "Summary ZIP 업로드":
+                if dash_zip is None:
+                    st.warning("Summary ZIP을 업로드하세요.")
+                    st.stop()
+                dash_name, dash_bytes = build_dashboard_from_zip_bytes(dash_zip.getvalue(), dash_zip.name)
+            else:
+                if not dash_files:
+                    st.warning("Summary 파일을 하나 이상 업로드하세요.")
+                    st.stop()
+                file_items = [(f.name, f.getvalue()) for f in dash_files]
+                dash_name, dash_bytes = build_dashboard_from_file_bytes(file_items)
 
         st.success("Dashboard 생성 완료!")
         st.download_button(
@@ -455,8 +519,9 @@ if st.button("📊 Dashboard 생성하기", width="stretch", key="btn-build-dash
             data=dash_bytes,
             file_name=dash_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl-dashboard"
+            use_container_width=True,
+            key="dl-dashboard",
         )
 
     except Exception as e:
-        st.error(f"Dashboard 생성 실패: {e}")
+        show_error(e)

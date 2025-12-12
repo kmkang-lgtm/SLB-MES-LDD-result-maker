@@ -1,308 +1,236 @@
-import pandas as pd
-import numpy as np
-import zipfile
-import tempfile
+# summary_engine.py
+# Result ZIP (KHD/WPH x Lane1/2) → Deviation Summary 엑셀 생성
+# - errors.py(UserFacingError) 기반 사용자 친화 에러 적용
+# - 입력: zip bytes
+# - 출력: (summary_filename, summary_bytes)
+
+from __future__ import annotations
+
+import io
+import os
 import re
-import time
-import shutil
-import gc
-from pathlib import Path
+import zipfile
+from datetime import datetime
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, Alignment, Border, Side
+
+from errors import UserFacingError, invalid_zip_error
 
 
-# ---------------------------
-# 0) zip 파일명에서 날짜 추출
-# ---------------------------
-def extract_date_from_zipname(zip_filename: str):
-    name = Path(zip_filename).stem
-    m = re.search(r"SLB_MES_Result_Package_(\d{1,2}\.\d{1,2})", name)
+# ---------------------------------
+# Helpers
+# ---------------------------------
+REQUIRED_KEYS = {
+    ("WPH", "1Lane"),
+    ("WPH", "2Lane"),
+    ("KHD", "1Lane"),
+    ("KHD", "2Lane"),
+}
+
+
+def _extract_mmdd_from_zipname(zip_name: str) -> str:
+    m = re.search(r"_(\d{2}\.\d{2})", zip_name)
+    if m:
+        return m.group(1)
+    return datetime.now().strftime("%m.%d")
+
+
+def _parse_dtype_lane(filename: str) -> Tuple[str, str]:
+    """
+    SLB_MES_{dtype}_Result_{lane}.xlsx → (dtype, lane)
+    """
+    name = os.path.basename(filename)
+    m = re.search(r"SLB_MES_(KHD|WPH)_Result_(1Lane|2Lane)\.xlsx", name)
     if not m:
-        return name.split("_")[-1]
-    return m.group(1)
+        raise UserFacingError(
+            title="Result 파일 이름 형식이 올바르지 않습니다.",
+            detail=f"파일명: {name}",
+            hint="Result ZIP은 app.py에서 생성된 패키지를 사용하세요.",
+            code="INVALID_RESULT_FILENAME",
+        )
+    return m.group(1), m.group(2)
 
 
-# ---------------------------
-# 1) 원본 파일 파싱 규칙
-# ---------------------------
-def parse_one_sheet(file_path, sheet_name):
-    raw = pd.read_excel(file_path, sheet_name=sheet_name, header=1)
-    positions = raw.iloc[0].iloc[1:].tolist()
-    data = raw.iloc[4:, 1:].copy()
-    data.columns = positions
-    data = data.apply(pd.to_numeric, errors="coerce")
-    return data
-
-
-# ---------------------------
-# 2) 시트=포지션 flatten 통계 + Material 자동룰
-# ---------------------------
-def sheet_as_position_stats(file_path):
-    with pd.ExcelFile(file_path) as xls:
-        sheet_names = [s for s in xls.sheet_names if s.lower() != "summary"]
-
-    prefix_has_2 = {}
-    for s in sheet_names:
-        if not isinstance(s, str) or "-" not in s:
-            continue
-        prefix, suffix = s.rsplit("-", 1)
-        prefix = prefix.strip()
-        suffix = suffix.strip()
-        prefix_has_2.setdefault(prefix, False)
-        if suffix == "2":
-            prefix_has_2[prefix] = True
-
-    rows = []
-    for s in sheet_names:
-        d = parse_one_sheet(file_path, s)
-        vals = d.to_numpy().ravel()
-        vals = vals[~np.isnan(vals)]
-        if len(vals) == 0:
-            continue
-
-        mean = float(vals.mean())
-        std  = float(vals.std(ddof=1))
-        group = s.split()[0] if isinstance(s, str) else ""
-
-        material = ""
-        if isinstance(s, str) and "-" in s:
-            prefix, _ = s.rsplit("-", 1)
-            prefix = prefix.strip()
-            material = "AL" if prefix_has_2.get(prefix, False) else "CU"
-
-        rows.append({
-            "position": s,
-            "group": group,
-            "Material": material,
-            "count": int(len(vals)),
-            "mean": mean,
-            "std": std,
-            "min": float(vals.min()),
-            "max": float(vals.max()),
-            "range": float(vals.max() - vals.min()),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# ---------------------------
-# 3) Lane 블록(= WPH | KHD)
-# ---------------------------
-def make_lane_block(wph_df, khd_df):
-    cols = ["position","group","Material","count","mean","std","min","max","range"]
-
-    wph_block = wph_df[cols].copy()
-    khd_block = khd_df[cols].copy()
-
-    max_len = max(len(wph_block), len(khd_block))
-    wph_block = wph_block.reindex(range(max_len))
-    khd_block = khd_block.reindex(range(max_len))
-
-    block = pd.concat([wph_block, khd_block], axis=1)
-    return block
-
-
-# ---------------------------
-# 4) 최종 Summary 생성
-# ---------------------------
-def build_final_summary_single_sheet(
-    wph_1lane_path, wph_2lane_path,
-    khd_1lane_path, khd_2lane_path,
-    output_path,
-    sheet_name
-):
-    wph1 = sheet_as_position_stats(wph_1lane_path)
-    wph2 = sheet_as_position_stats(wph_2lane_path)
-    khd1 = sheet_as_position_stats(khd_1lane_path)
-    khd2 = sheet_as_position_stats(khd_2lane_path)
-
-    block_1lane = make_lane_block(wph1, khd1)
-    block_2lane = make_lane_block(wph2, khd2)
-
-    max_len = max(len(block_1lane), len(block_2lane))
-    block_1lane = block_1lane.reindex(range(max_len))
-    block_2lane = block_2lane.reindex(range(max_len))
-
-    lane1_col = pd.DataFrame({"Lane": [1] * max_len})
-    lane2_col = pd.DataFrame({"Lane": [2] * max_len})
-    gap_cols  = pd.DataFrame({" ": [""] * max_len})
-
-    final_df = pd.concat([lane1_col, block_1lane, gap_cols, lane2_col, block_2lane], axis=1)
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        final_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
-
-        wb = writer.book
-        ws = writer.sheets[sheet_name]
-
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-        from openpyxl.utils import get_column_letter
-
-        title_font  = Font(bold=True, size=12)
-        header_font = Font(bold=True)
-        center = Alignment(horizontal="center", vertical="center")
-
-        fill_wph = PatternFill("solid", fgColor="EAF2FF")
-        fill_khd = PatternFill("solid", fgColor="F3F3F3")
-
-        thick = Side(style="medium", color="000000")
-        boundary_border = Border(right=thick)
-
-        max_row = ws.max_row
-        max_col = ws.max_column
-
-        lane_label_w = 1
-        wph_w = 9
-        khd_w = 9
-        lane_block_w = wph_w + khd_w
-        gap_w = 1
-
-        col_lane1 = 1
-        col_wph1  = col_lane1 + lane_label_w
-        col_khd1  = col_wph1 + wph_w
-
-        col_lane2 = col_lane1 + lane_label_w + lane_block_w + gap_w
-        col_wph2  = col_lane2 + lane_label_w
-        col_khd2  = col_wph2 + wph_w
-
-        for col, txt in [(col_wph1,"WPH"),(col_khd1,"KHD"),(col_wph2,"WPH"),(col_khd2,"KHD")]:
-            ws.cell(row=2, column=col).value = txt
-            ws.cell(row=2, column=col).font = title_font
-            ws.cell(row=2, column=col).alignment = center
-
-        for c in range(1, max_col + 1):
-            cell = ws.cell(row=3, column=c)
-            cell.font = header_font
-            cell.alignment = center
-            cell.fill = PatternFill("solid", fgColor="FFFFFF")
-
-        for r in range(4, max_row + 1):
-            for c in range(1, max_col + 1):
-                cell = ws.cell(row=r, column=c)
-                cell.alignment = center
-
-                if col_wph1 <= c <= col_wph1 + wph_w - 1:
-                    cell.fill = fill_wph
-                if col_khd1 <= c <= col_khd1 + khd_w - 1:
-                    cell.fill = fill_khd
-
-                if col_wph2 <= c <= col_wph2 + wph_w - 1:
-                    cell.fill = fill_wph
-                if col_khd2 <= c <= col_khd2 + khd_w - 1:
-                    cell.fill = fill_khd
-
-                if c in [col_lane1, col_lane2]:
-                    cell.number_format = "0"
-
-                int_cols = [
-                    col_wph1+3, col_wph1+6, col_wph1+7, col_wph1+8,
-                    col_khd1+3, col_khd1+6, col_khd1+7, col_khd1+8,
-                    col_wph2+3, col_wph2+6, col_wph2+7, col_wph2+8,
-                    col_khd2+3, col_khd2+6, col_khd2+7, col_khd2+8
-                ]
-                if c in int_cols:
-                    cell.number_format = "0"
-
-                float_cols = [
-                    col_wph1+4, col_wph1+5,
-                    col_khd1+4, col_khd1+5,
-                    col_wph2+4, col_wph2+5,
-                    col_khd2+4, col_khd2+5
-                ]
-                if c in float_cols:
-                    cell.number_format = "0.000"
-
-                if c == col_wph1 + wph_w - 1 or c == col_wph2 + wph_w - 1:
-                    cell.border = boundary_border
-
-        thick_side = Side(style="medium", color="000000")
-
-        def apply_outer_border(ws, r1, r2, c1, c2):
-            from openpyxl.styles import Border
-            for r in range(r1, r2 + 1):
-                for c in range(c1, c2 + 1):
-                    cell = ws.cell(row=r, column=c)
-                    b = cell.border
-                    cell.border = Border(
-                        left   = thick_side if c == c1 else b.left,
-                        right  = thick_side if c == c2 else b.right,
-                        top    = thick_side if r == r1 else b.top,
-                        bottom = thick_side if r == r2 else b.bottom
-                    )
-
-        apply_outer_border(ws, 4, max_row, col_lane1, col_khd1 + khd_w - 1)
-        apply_outer_border(ws, 4, max_row, col_lane2, col_khd2 + khd_w - 1)
-
-        from openpyxl.utils import get_column_letter
-        for c in range(1, max_col + 1):
-            ws.column_dimensions[get_column_letter(c)].width = 11
-        ws.column_dimensions[get_column_letter(col_lane1)].width = 6
-        ws.column_dimensions[get_column_letter(col_lane2)].width = 6
-
-        ws.freeze_panes = "A4"
-
-    gc.collect()
-
-
-# ---------------------------
-# 5) ✅ Streamlit용 엔트리: zip bytes로 Summary 생성
-# ---------------------------
-def build_from_zip_bytes(zip_bytes: bytes, zip_filename: str):
-    date_str = extract_date_from_zipname(zip_filename)
-    sheet_name = date_str
-
-    output_name = f"SLB_SV_LDD_Deviation_Summary_{date_str}.xlsx"
-
-    tmpdir = tempfile.mkdtemp()
+def _collect_result_files(zip_bytes: bytes, zip_name: str) -> Dict[Tuple[str, str], bytes]:
     try:
-        # zip을 임시파일로 저장 후 extract
-        zip_path = Path(tmpdir) / zip_filename
-        with open(zip_path, "wb") as f:
-            f.write(zip_bytes)
-
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(tmpdir)
-
-        files = list(Path(tmpdir).glob("*.xlsx"))
-
-        def pick(k1, k2):
-            for f in files:
-                name = f.name.lower()
-                if k1.lower() in name and k2.lower() in name:
-                    return str(f)
-            return None
-
-        wph_1 = pick("wph", "1lane")
-        wph_2 = pick("wph", "2lane")
-        khd_1 = pick("khd", "1lane")
-        khd_2 = pick("khd", "2lane")
-
-        missing = [k for k, v in {
-            "WPH 1Lane": wph_1, "WPH 2Lane": wph_2,
-            "KHD 1Lane": khd_1, "KHD 2Lane": khd_2
-        }.items() if v is None]
-
-        if missing:
-            raise FileNotFoundError(
-                f"zip 안에서 파일을 못 찾음: {missing}\n"
-                f"파일명에 WPH/KHD, 1Lane/2Lane 키워드가 포함되어 있는지 확인해줘."
-            )
-
-        out_path = str(Path(tmpdir) / output_name)
-        build_final_summary_single_sheet(
-            wph_1, wph_2, khd_1, khd_2,
-            output_path=out_path,
-            sheet_name=sheet_name
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+    except Exception as e:
+        raise invalid_zip_error(
+            detail=f"파일: {zip_name}\n오류: {e}",
+            context={"zip": zip_name},
         )
 
-        with open(out_path, "rb") as f:
-            summary_bytes = f.read()
+    files: Dict[Tuple[str, str], bytes] = {}
+    for n in zf.namelist():
+        if not n.lower().endswith(".xlsx"):
+            continue
+        if n.startswith("__MACOSX/"):
+            continue
 
-        return output_name, summary_bytes
+        dtype, lane = _parse_dtype_lane(n)
+        files[(dtype, lane)] = zf.read(n)
 
-    finally:
-        gc.collect()
-        for _ in range(5):
-            try:
-                shutil.rmtree(tmpdir)
-                break
-            except PermissionError:
-                time.sleep(0.5)
+    missing = REQUIRED_KEYS - set(files.keys())
+    if missing:
+        raise UserFacingError(
+            title="Deviation Summary 생성에 필요한 Result 파일이 부족합니다.",
+            detail=f"필요: {sorted(REQUIRED_KEYS)}\n누락: {sorted(missing)}",
+            hint="KHD/WPH, Lane1/Lane2 Result가 모두 생성되었는지 확인하세요.",
+            code="MISSING_RESULT_FILES",
+        )
+
+    return files
+
+
+def _extract_position_values(wb) -> Dict[str, list]:
+    """
+    Result 엑셀에서 summary 시트를 제외한 모든 시트를 읽어
+    position별 값 리스트를 수집
+    """
+    pos_vals: Dict[str, list] = {}
+
+    for ws in wb.worksheets:
+        if ws.title.lower() == "summary":
+            continue
+
+        # Raw 영역은 7행부터, 2열(B)부터 시작 (engine.py 기준)
+        for c in range(2, ws.max_column + 1):
+            values = []
+            for r in range(7, ws.max_row + 1):
+                v = ws.cell(row=r, column=c).value
+                if v is None:
+                    continue
+                try:
+                    values.append(float(v))
+                except Exception:
+                    continue
+
+            if values:
+                key = ws.title.strip()
+                pos_vals.setdefault(key, []).extend(values)
+
+    return pos_vals
+
+
+def _material_from_position(position: str) -> str:
+    """
+    summary_engine 기준 Material 규칙:
+    - 같은 prefix에서 '-2'가 존재하면 AL
+    - 아니면 CU
+    """
+    if "-2" in position:
+        return "AL"
+    return "CU"
+
+
+def _build_block(
+    files: Dict[Tuple[str, str], bytes],
+    dtype: str,
+    lane: str,
+) -> pd.DataFrame:
+    """
+    하나의 블록(WPH/KHD x Lane)에 대해
+    position별 통계(mean/std/min/max/range) 계산
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(files[(dtype, lane)]), data_only=True)
+    pos_vals = _extract_position_values(wb)
+    wb.close()
+
+    records = []
+    for pos, vals in pos_vals.items():
+        arr = np.array(vals, dtype=float)
+        if arr.size == 0:
+            continue
+
+        records.append(
+            {
+                "Position": pos,
+                "Material": _material_from_position(pos),
+                "Mean": float(np.mean(arr)),
+                "Std": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0,
+                "Min": float(np.min(arr)),
+                "Max": float(np.max(arr)),
+                "Range": float(np.max(arr) - np.min(arr)),
+            }
+        )
+
+    if not records:
+        raise UserFacingError(
+            title="Result 파일에서 유효한 데이터를 찾지 못했습니다.",
+            detail=f"dtype={dtype}, lane={lane}",
+            hint="Result 파일이 비어있거나 템플릿 Raw 영역이 변경됐는지 확인하세요.",
+            code="NO_VALID_DATA",
+        )
+
+    df = pd.DataFrame(records).sort_values("Position").reset_index(drop=True)
+    return df
+
+
+# ---------------------------------
+# Public API
+# ---------------------------------
+def build_from_zip_bytes(zip_bytes: bytes, zip_name: str) -> Tuple[str, bytes]:
+    """
+    zip_bytes: Result ZIP bytes
+    zip_name: ZIP 파일명(날짜 추출용)
+    return: (summary_filename, summary_bytes)
+    """
+    files = _collect_result_files(zip_bytes, zip_name)
+    mmdd = _extract_mmdd_from_zipname(zip_name)
+
+    # Lane1 / Lane2 블록 생성
+    blocks = {}
+    for dtype, lane in REQUIRED_KEYS:
+        blocks[(dtype, lane)] = _build_block(files, dtype, lane)
+
+    # -----------------------------
+    # Summary 엑셀 작성
+    # -----------------------------
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Summary_{mmdd}"
+
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    col = 1
+    for lane in ["1Lane", "2Lane"]:
+        for dtype in ["WPH", "KHD"]:
+            df = blocks[(dtype, lane)]
+
+            # 타이틀
+            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 6)
+            t = ws.cell(row=1, column=col)
+            t.value = f"{dtype} {lane}"
+            t.font = bold
+            t.alignment = center
+
+            # 헤더
+            headers = list(df.columns)
+            for j, h in enumerate(headers):
+                c = ws.cell(row=2, column=col + j)
+                c.value = h
+                c.font = bold
+                c.alignment = center
+                c.border = border
+
+            # 데이터
+            for i, row in df.iterrows():
+                for j, h in enumerate(headers):
+                    c = ws.cell(row=3 + i, column=col + j)
+                    c.value = row[h]
+                    c.border = border
+
+            col += len(headers) + 1  # 블록 간 공백
+
+    out_name = f"SLB_MES_Deviation_Summary_{mmdd}.xlsx"
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    return out_name, buf.getvalue()
