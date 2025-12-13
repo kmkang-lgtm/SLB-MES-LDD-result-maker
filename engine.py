@@ -214,13 +214,21 @@ def make_results_for_input(
     templates: dict,
     output_dir: str,
     raw_end_row: int = 100,
-    selected_hours=None,  # ✅ app.py에서 넘어오는 선택 시간대(list[int])
+    selected_hours=None,  # app.py에서 넘어오는 선택 시간대 적용됨(list[int])
+    include_lanes=None, 
+    include_dtypes=None,
 ):
     """
     input_path: 원본 MES 엑셀 경로
     templates: {"KHD": ".../TEMPLATE_KHD.xlsx", "WPH": ".../TEMPLATE_WPH.xlsx"}
     output_dir: 결과 저장 폴더
     """
+    # include_*가 빈 리스트로 들어오면 전부 스킵될 수 있어 None 처리
+    if include_lanes is not None and len(include_lanes) == 0:
+        include_lanes = None
+    if include_dtypes is not None and len(include_dtypes) == 0:
+        include_dtypes = None
+
     if not os.path.exists(input_path):
         raise UserFacingError(
             title="입력 파일을 찾을 수 없습니다.",
@@ -243,6 +251,9 @@ def make_results_for_input(
         )
 
     for lane_key, sheets in LANE_SHEETS.items():
+        # ✅ lane 선택 적용
+        if include_lanes and lane_key not in include_lanes:
+            continue
         raw_lane = load_lane_raw(xl, sheets, input_path=input_path, lane_key=lane_key)
 
         # 선택 시간 적용 후 시간이 하나도 없으면 사용자 친화 에러
@@ -258,6 +269,10 @@ def make_results_for_input(
 
         for dtype, df_dtype in raw_lane.groupby("dtype"):
             if dtype == "UNKNOWN":
+                continue
+
+            # ✅ dtype 선택 적용
+            if include_dtypes and dtype not in include_dtypes:
                 continue
 
             if dtype not in templates:

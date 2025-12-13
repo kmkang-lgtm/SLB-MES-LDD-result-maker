@@ -1,6 +1,3 @@
-# app.py
-# Streamlit UI: 원본 → (Validation + 4개 미리보기 + 추천 시간필터 적용) → Result ZIP 생성 → Summary → Dashboard
-
 import io
 import os
 import zipfile
@@ -75,19 +72,31 @@ def _zip_bytes_from_folder(folder_path: str, zip_name: str) -> bytes:
     return buf.getvalue()
 
 
-def _collect_input_files(uploaded_files, uploaded_zip) -> list[tuple[str, bytes]]:
+def _collect_input_files(uploaded_files, uploaded_zip, input_source: str | None) -> list[tuple[str, bytes]]:
+    """
+    return: [(filename, file_bytes), ...]
+    input_source:
+      - "ZIP 사용" / "엑셀 파일 사용" / None
+    """
     items: list[tuple[str, bytes]] = []
-    if uploaded_zip is not None:
+
+    if input_source == "ZIP 사용":
+        if uploaded_zip is None:
+            return []
         z = zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()))
         for n in z.namelist():
             if n.lower().endswith(".xlsx") and not n.startswith("__MACOSX/"):
                 items.append((os.path.basename(n), z.read(n)))
         return items
 
-    if uploaded_files:
+    if input_source == "엑셀 파일 사용":
+        if not uploaded_files:
+            return []
         for uf in uploaded_files:
             items.append((uf.name, uf.getvalue()))
-    return items
+        return items
+
+    return []
 
 
 def _try_copy_default(src: str, dst: str) -> None:
@@ -148,6 +157,17 @@ def _hours_to_labels(hours: list[int]) -> list[int]:
     return [24 if h == 0 else h for h in hours]
 
 
+def _apply_recommend_exclude(exclude_labels: list[int]) -> None:
+    """
+    Streamlit widget(key='hour_filter') 업데이트는 on_click 콜백에서 수행해야 안정적임.
+    """
+    cur = set(st.session_state.get("hour_filter", []))
+    new = sorted(list(cur - set(exclude_labels)))
+    # 전부 빠져버리면 적용하지 않음(사용자 실수 방지)
+    if new:
+        st.session_state["hour_filter"] = new
+
+
 # ---------------------------
 # Session State defaults
 # ---------------------------
@@ -157,15 +177,23 @@ st.session_state.setdefault("zip_filename", None)
 st.session_state.setdefault("validation_result", None)
 st.session_state.setdefault("validation_ok", False)
 
-# 시간 multiselect는 key 기반으로 제어(추천 적용 버튼에서 값 변경)
+# 시간 multiselect는 key 기반으로 제어
 hour_labels = list(range(1, 25))
 st.session_state.setdefault("hour_filter", hour_labels[:])  # 최초 기본은 전체
+
+# 생성 범위 기본
+st.session_state.setdefault("include_lanes", ["1Lane", "2Lane"])
+st.session_state.setdefault("include_dtypes", ["KHD", "WPH"])
+
+# 다운로드 형태 기본
+st.session_state.setdefault("dl_zip", True)
+st.session_state.setdefault("dl_each", False)
 
 
 # ---------------------------
 # Section 1: Result 생성
 # ---------------------------
-st.subheader("1) Result 생성 (원본 → Lane별 Result 엑셀 → ZIP)")
+st.subheader("1) Result 생성 (원본 → Lane별 Result 엑셀 → ZIP/개별 다운로드)")
 
 colA, colB = st.columns([2, 1], gap="large")
 
@@ -184,33 +212,73 @@ with colA:
         key="uploader_xlsx_zip",
     )
 
+    # ✅ 둘 다 업로드 시 선택 / 하나만 있으면 자동
+    input_source = None
+    if uploaded_files and uploaded_zip:
+        input_source = st.radio(
+            "입력 소스 선택",
+            ["ZIP 사용", "엑셀 파일 사용"],
+            horizontal=True,
+            key="input_source_choice",
+        )
+    elif uploaded_zip:
+        input_source = "ZIP 사용"
+    elif uploaded_files:
+        input_source = "엑셀 파일 사용"
+
 with colB:
-    st.markdown("### 템플릿")
     default_khd = "templates/TEMPLATE_KHD.xlsx"
     default_wph = "templates/TEMPLATE_WPH.xlsx"
 
-    tpl_khd_upload = st.file_uploader("KHD 템플릿 업로드(선택)", type=["xlsx"], key="tpl_khd")
-    tpl_wph_upload = st.file_uploader("WPH 템플릿 업로드(선택)", type=["xlsx"], key="tpl_wph")
+    # ✅ 옵션/템플릿/시간필터 숨김
+    with st.expander("⚙️ 고급 옵션(템플릿/시간/Raw)", expanded=False):
+        st.markdown("### 템플릿")
+        tpl_khd_upload = st.file_uploader("KHD 템플릿 업로드(선택)", type=["xlsx"], key="tpl_khd")
+        tpl_wph_upload = st.file_uploader("WPH 템플릿 업로드(선택)", type=["xlsx"], key="tpl_wph")
 
-    st.markdown("### 옵션")
-    raw_end_row = st.number_input(
-        "Raw 끝행(raw_end_row)",
-        min_value=20,
-        max_value=5000,
-        value=100,
-        step=10,
-        help="템플릿 차트가 참조하는 Raw 데이터 영역의 마지막 행",
-    )
+        st.markdown("### 옵션")
+        raw_end_row = st.number_input(
+            "Raw 끝행(raw_end_row)",
+            min_value=20,
+            max_value=5000,
+            value=100,
+            step=10,
+            help="템플릿 차트가 참조하는 Raw 데이터 영역의 마지막 행",
+            key="raw_end_row",
+        )
 
-    # key="hour_filter" 로 session_state 직접 제어
+        st.multiselect(
+            "시간 필터(선택한 시간대만 반영)",
+            options=hour_labels,
+            key="hour_filter",
+            help="24는 자정(00시)로 처리됩니다.",
+        )
+
+    # ✅ 생성 범위 선택(보이게)
+    st.markdown("### 생성 범위 선택")
     st.multiselect(
-        "시간 필터(선택한 시간대만 반영)",
-        options=hour_labels,
-        key="hour_filter",
-        help="24는 자정(00시)로 처리됩니다.",
+        "Lane 선택",
+        ["1Lane", "2Lane"],
+        default=st.session_state["include_lanes"],
+        key="include_lanes",
     )
-    selected_labels = st.session_state["hour_filter"]
-    selected_hours = _parse_selected_hours(selected_labels)
+    st.multiselect(
+        "Type 선택",
+        ["KHD", "WPH"],
+        default=st.session_state["include_dtypes"],
+        key="include_dtypes",
+    )
+
+    # ✅ 다운로드 형태 선택(보이게)
+    st.markdown("### 다운로드 형태")
+    st.checkbox("ZIP 다운로드", value=st.session_state["dl_zip"], key="dl_zip")
+    st.checkbox("개별 엑셀 다운로드", value=st.session_state["dl_each"], key="dl_each")
+
+# hour 필터 파싱
+selected_labels = st.session_state["hour_filter"]
+selected_hours = _parse_selected_hours(selected_labels)
+raw_end_row_val = int(st.session_state.get("raw_end_row", 100))
+
 
 # ---------------------------
 # Validation + 4개 미리보기 + 추천 적용
@@ -221,7 +289,7 @@ validate_btn = st.button("🔍 사전 점검 실행", use_container_width=True, 
 
 if validate_btn:
     try:
-        inputs = _collect_input_files(uploaded_files, uploaded_zip)
+        inputs = _collect_input_files(uploaded_files, uploaded_zip, input_source)
         if not inputs:
             st.warning("원본 엑셀(.xlsx) 파일을 업로드하거나 ZIP을 업로드하세요.")
             st.stop()
@@ -229,10 +297,15 @@ if validate_btn:
         templates_for_validation = _prepare_templates_on_temp(
             default_khd=default_khd,
             default_wph=default_wph,
-            tpl_khd_upload=tpl_khd_upload,
-            tpl_wph_upload=tpl_wph_upload,
+            tpl_khd_upload=st.session_state.get("tpl_khd"),
+            tpl_wph_upload=st.session_state.get("tpl_wph"),
             tmp_root_prefix="mes_validate_",
         )
+        # 위에서 uploader를 expander 안에서 만들었기 때문에
+        # 직접 변수(tpl_khd_upload/tpl_wph_upload)를 쓰는 쪽이 더 안전함:
+        # -> 아래 두 줄로 교체
+        # templates_for_validation = _prepare_templates_on_temp(default_khd, default_wph, tpl_khd_upload, tpl_wph_upload, "mes_validate_")
+
         template_sheetnames = _get_template_sheetnames(templates_for_validation)
 
         with st.spinner("사전 점검 중..."):
@@ -281,12 +354,13 @@ if vr:
             + (", ".join(f"{h:02d}" for h in exclude_labels) if exclude_labels else "없음")
         )
     with cols[1]:
-        if st.button("✅ 추천 시간 제외 적용(원클릭)", use_container_width=True, key="btn_apply_reco"):
-            # 현재 선택에서 추천 제외 시간을 제거
-            cur = set(st.session_state["hour_filter"])
-            new = sorted(list(cur - set(exclude_labels)))
-            st.session_state["hour_filter"] = new if new else st.session_state["hour_filter"]
-            st.rerun()
+        st.button(
+            "✅ 추천 시간 제외 적용(원클릭)",
+            use_container_width=True,
+            key="btn_apply_reco",
+            on_click=_apply_recommend_exclude,
+            args=(exclude_labels,),
+        )
 
     # 파일별 4개 미리보기 (KHD/WPH x 1Lane/2Lane)
     st.markdown("#### 👀 4개 결과 미리보기 (대표 item 1개씩)")
@@ -296,7 +370,6 @@ if vr:
         with st.expander(f"📄 {fname} 미리보기", expanded=True):
             previews = pack.get("previews", {})
 
-            # 2x2 배치: (KHD 1Lane, KHD 2Lane, WPH 1Lane, WPH 2Lane)
             order = [("KHD", "1Lane"), ("KHD", "2Lane"), ("WPH", "1Lane"), ("WPH", "2Lane")]
             c1, c2 = st.columns(2, gap="large")
             slot_cols = [c1, c2, c1, c2]
@@ -318,31 +391,33 @@ if vr:
                     low = data.get("low_hours", [])
 
                     if miss:
-                        st.error(f"1시간 공백(데이터 0개): {', '.join(f'{h:02d}' for h in _hours_to_labels(miss))}")
+                        st.error(
+                            f"1시간 공백(데이터 0개): {', '.join(f'{h:02d}' for h in _hours_to_labels(miss))}"
+                        )
                     else:
                         st.success("1시간 공백 없음")
 
                     if low:
-                        st.warning(f"샘플 수 부족(<3): {', '.join(f'{h:02d}' for h in _hours_to_labels(low))}")
+                        st.warning(
+                            f"샘플 수 부족(<3): {', '.join(f'{h:02d}' for h in _hours_to_labels(low))}"
+                        )
 
-                    # 시간별 AVG 라인차트(대표 item)
                     s = pd.Series(data["hourly_avg_series"])
-                    # 보기 좋게 라벨을 1..24 -> 01..24로 바꿔 표시(값은 그대로)
                     s.index = [f"{i:02d}" for i in range(1, 25)]
                     st.line_chart(s)
 
             if vr.get("summary_rows"):
                 st.markdown("##### 📋 요약 테이블")
-                # 해당 파일 row만
                 rows = [r for r in vr["summary_rows"] if r.get("File") == fname]
                 if rows:
                     st.dataframe(rows, use_container_width=True)
+
 
 # ---------------------------
 # Result 생성 버튼(Validation 통과 시 활성)
 # ---------------------------
 make_btn = st.button(
-    "✅ Result ZIP 생성하기",
+    "Result 생성하기",
     use_container_width=True,
     disabled=not st.session_state.get("validation_ok", False),
 )
@@ -352,22 +427,34 @@ if make_btn:
         st.warning("먼저 사전 점검을 실행하고, 통과한 뒤 Result를 생성하세요.")
         st.stop()
 
-    inputs = _collect_input_files(uploaded_files, uploaded_zip)
+    inputs = _collect_input_files(uploaded_files, uploaded_zip, input_source)
     if not inputs:
         st.warning("원본 엑셀(.xlsx) 파일을 업로드하거나 ZIP을 업로드하세요.")
         st.stop()
+
+    # 템플릿 준비
+    # (expander 안에서 만든 uploader 변수는 scope상 안전하므로 직접 쓰는 것이 가장 확실)
+    try:
+        tpl_khd_upload = st.session_state.get("tpl_khd")
+        tpl_wph_upload = st.session_state.get("tpl_wph")
+    except Exception:
+        tpl_khd_upload = None
+        tpl_wph_upload = None
 
     templates = _prepare_templates_on_temp(
         default_khd=default_khd,
         default_wph=default_wph,
         tpl_khd_upload=tpl_khd_upload,
         tpl_wph_upload=tpl_wph_upload,
-        tmp_root_prefix="mes_run_",
+        tmp_root_prefix="mes_run_tpl_",
     )
 
-    tmp_root = tempfile.mkdtemp(prefix="mes_run_")  # 결과/입력 저장용
+    tmp_root = tempfile.mkdtemp(prefix="mes_run_")
     out_dir = os.path.join(tmp_root, "outputs")
     os.makedirs(out_dir, exist_ok=True)
+
+    include_lanes = st.session_state.get("include_lanes", ["1Lane", "2Lane"])
+    include_dtypes = st.session_state.get("include_dtypes", ["KHD", "WPH"])
 
     def _run_make():
         created_all: list[str] = []
@@ -381,34 +468,53 @@ if make_btn:
                 input_path=in_path,
                 templates=templates,
                 output_dir=out_dir,
-                raw_end_row=int(raw_end_row),
+                raw_end_row=int(raw_end_row_val),
                 selected_hours=_parse_selected_hours(st.session_state["hour_filter"]),
+                include_lanes=include_lanes,
+                include_dtypes=include_dtypes,
             )
             created_all.extend(created)
 
         if not created_all:
-            raise Exception("생성된 결과 파일이 없습니다.")
+            raise Exception("생성된 결과 파일이 없습니다. (선택한 Lane/Type 범위를 확인하세요.)")
         return created_all
 
     created_files = run_with_ui_error(_run_make, spinner_text="Result 생성 중...")
     if created_files is None:
         st.stop()
 
-    zip_name = f"SLB_MES_Result_Package_{_now_mmdd()}.zip"
-    zip_bytes = _zip_bytes_from_folder(out_dir, zip_name)
+    # ✅ ZIP 다운로드(선택)
+    if st.session_state.get("dl_zip", True):
+        zip_name = f"SLB_MES_Result_Package_{_now_mmdd()}.zip"
+        zip_bytes = _zip_bytes_from_folder(out_dir, zip_name)
 
-    st.session_state["zip_bytes"] = zip_bytes
-    st.session_state["zip_filename"] = zip_name
+        st.session_state["zip_bytes"] = zip_bytes
+        st.session_state["zip_filename"] = zip_name
 
-    st.success("Result ZIP 생성 완료!")
-    st.download_button(
-        "⬇️ Result ZIP 다운로드",
-        data=zip_bytes,
-        file_name=zip_name,
-        mime="application/zip",
-        use_container_width=True,
-        key="dl-result-zip",
-    )
+        st.success("Result ZIP 생성 완료!")
+        st.download_button(
+            "⬇️ Result ZIP 다운로드",
+            data=zip_bytes,
+            file_name=zip_name,
+            mime="application/zip",
+            use_container_width=True,
+            key="dl-result-zip",
+        )
+
+    # ✅ 개별 엑셀 다운로드(선택)
+    if st.session_state.get("dl_each", False):
+        st.markdown("### 개별 Result 엑셀 다운로드")
+        for p in created_files:
+            bn = os.path.basename(p)
+            with open(p, "rb") as f:
+                st.download_button(
+                    f"⬇️ {bn}",
+                    data=f.read(),
+                    file_name=bn,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"dl_each_{bn}",
+                )
 
     with st.expander("생성된 파일 목록"):
         for p in created_files:
