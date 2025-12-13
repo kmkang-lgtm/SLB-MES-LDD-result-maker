@@ -33,6 +33,17 @@ def parse_result_xlsx(file_path: str):
     wb = openpyxl.load_workbook(file_path, data_only=True)
     records = []
 
+    # ✅ AL1/AL2 분류를 위한 1차 스캔: '-2'가 존재하는 prefix 수집
+    prefixes_with_2 = set()
+    for _ws in wb.worksheets:
+        if _ws.title.lower() == "summary":
+            continue
+        _name = str(_ws.title).strip()
+        if "-" in _name:
+            _prefix, _suffix = _name.rsplit("-", 1)
+            if _suffix.strip() == "2":
+                prefixes_with_2.add(_prefix.strip())
+
     for ws in wb.worksheets:
         if ws.title.lower() == "summary":
             continue
@@ -55,7 +66,20 @@ def parse_result_xlsx(file_path: str):
         arr = np.array(vals, dtype=float)
         position = ws.title
 
-        material = "AL" if "-2" in position else "CU"
+        # ✅ prefix/suffix 기반 Material 분류: AL1/AL2/CU
+        name = str(position).strip()
+        material = "CU"
+        if "-" in name:
+            prefix, suffix = name.rsplit("-", 1)
+            prefix = prefix.strip()
+            suffix = suffix.strip()
+            if suffix == "2":
+                material = "AL2"
+            elif suffix == "1" and prefix in prefixes_with_2:
+                material = "AL1"
+            else:
+                material = "CU"
+
         mean = float(np.mean(arr))
         std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
         mn = float(np.min(arr))
