@@ -202,6 +202,11 @@ st.session_state.setdefault("include_dtypes", ["KHD", "WPH"])
 st.session_state.setdefault("dl_zip", True)
 st.session_state.setdefault("dl_each", False)
 
+st.session_state.setdefault("result_ready", False)
+st.session_state.setdefault("result_zip_name", None)
+st.session_state.setdefault("result_zip_bytes", None)
+st.session_state.setdefault("result_files", [])          # ["a.xlsx", "b.xlsx"...]
+st.session_state.setdefault("result_file_bytes", {})     # {"a.xlsx": b"...", ...}
 
 # ---------------------------
 # Section 1: Result 생성
@@ -496,42 +501,66 @@ if make_btn:
     if created_files is None:
         st.stop()
 
-    # ✅ ZIP 다운로드(선택)
+    st.session_state["result_ready"] = True
+
+    # ZIP 저장(옵션)
     if st.session_state.get("dl_zip", True):
         zip_name = f"SLB_MES_Result_Package_{_now_mmdd()}.zip"
         zip_bytes = _zip_bytes_from_folder(out_dir, zip_name)
+        st.session_state["result_zip_name"] = zip_name
+        st.session_state["result_zip_bytes"] = zip_bytes
 
+        # 기존 “직전 ZIP으로 Summary” 기능도 유지
         st.session_state["zip_bytes"] = zip_bytes
         st.session_state["zip_filename"] = zip_name
 
-        st.success("Result ZIP 생성 완료!")
-        st.download_button(
-            "⬇️ Result ZIP 다운로드",
-            data=zip_bytes,
-            file_name=zip_name,
-            mime="application/zip",
-            use_container_width=True,
-            key="dl-result-zip",
-        )
+    # 개별 파일 bytes 저장(옵션)
+    file_bytes_map = {}
+    file_names = []
+    for p in created_files:
+        bn = os.path.basename(p)
+        with open(p, "rb") as f:
+            file_bytes_map[bn] = f.read()
+        file_names.append(bn)
 
-    # ✅ 개별 엑셀 다운로드(선택)
-    if st.session_state.get("dl_each", False):
-        st.markdown("### 개별 Result 엑셀 다운로드")
-        for p in created_files:
-            bn = os.path.basename(p)
-            with open(p, "rb") as f:
-                st.download_button(
-                    f"⬇️ {bn}",
-                    data=f.read(),
-                    file_name=bn,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    key=f"dl_each_{bn}",
-                )
+    st.session_state["result_files"] = file_names
+    st.session_state["result_file_bytes"] = file_bytes_map
+
+    # (다운로드 버튼은 아래 '생성 결과 다운로드' 영역에서 세션 기반으로 렌더링됩니다.)
+
 
     with st.expander("생성된 파일 목록"):
         for p in created_files:
             st.write("-", os.path.basename(p))
+
+
+
+
+# ✅ 생성 후 다운로드 영역(클릭해도 유지)
+if st.session_state.get("result_ready"):
+    st.markdown("## 📦 생성 결과 다운로드")
+
+    if st.session_state.get("dl_zip", True) and st.session_state.get("result_zip_bytes"):
+        st.download_button(
+            "⬇️ Result ZIP 다운로드",
+            data=st.session_state["result_zip_bytes"],
+            file_name=st.session_state["result_zip_name"],
+            mime="application/zip",
+            use_container_width=True,
+            key="dl-result-zip-persist",
+        )
+
+    if st.session_state.get("dl_each", False):
+        st.markdown("### 📄 개별 Result 엑셀 다운로드")
+        for bn in st.session_state.get("result_files", []):
+            st.download_button(
+                f"⬇️ {bn}",
+                data=st.session_state["result_file_bytes"][bn],
+                file_name=bn,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"dl-each-persist-{bn}",
+            )
 
 
 # ---------------------------
