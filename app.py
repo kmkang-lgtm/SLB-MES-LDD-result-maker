@@ -18,6 +18,19 @@ from dashboard_engine import (
 from ui_error import show_error, run_with_ui_error
 from validator import pre_validate
 
+import inspect
+
+def call_make_results_for_input(**kwargs):
+    """
+    실행 환경에 따라 engine.make_results_for_input() 시그니처가 다를 수 있어
+    지원하는 인자만 골라서 호출합니다(배포/캐시/경로 충돌 시 TypeError 방지).
+    """
+    sig = inspect.signature(engine.make_results_for_input)
+    allowed = set(sig.parameters.keys())
+    safe_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+    return engine.make_results_for_input(**safe_kwargs)
+
+
 
 # ---------------------------
 # App Config / Password Gate
@@ -464,7 +477,7 @@ if make_btn:
             with open(in_path, "wb") as f:
                 f.write(fbytes)
 
-            created = engine.make_results_for_input(
+            created = call_make_results_for_input(
                 input_path=in_path,
                 templates=templates,
                 output_dir=out_dir,
