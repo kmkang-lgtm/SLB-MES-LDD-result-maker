@@ -2,6 +2,7 @@ import io
 import os
 import zipfile
 import tempfile
+import re
 from datetime import datetime
 
 import streamlit as st
@@ -72,6 +73,65 @@ if not st.session_state.authed:
 # ---------------------------
 def _now_mmdd() -> str:
     return datetime.now().strftime("%m.%d")
+
+def _extract_yymmdd_from_name(name: str) -> str | None:
+    """
+    파일명/zip명에서 날짜 추출
+    - 허용: YY.MM.DD (예: 25.12.14)
+    - 허용: YYYY.MM.DD (예: 2025.12.14) → YY.MM.DD로 축약
+    """
+    base = os.path.basename(name)
+
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{2})", base)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+
+    m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})", base)
+    if m:
+        yy = m.group(1)[2:]
+        return f"{yy}.{m.group(2)}.{m.group(3)}"
+
+    return None
+
+
+def _resolve_package_date(
+    inputs: list[tuple[str, bytes]],
+    input_source: str | None,
+    uploaded_zip,
+) -> str:
+    """
+    오늘 날짜 사용 금지.
+    - input_source가 'ZIP 사용'이면 업로드 ZIP 이름에서 YY.MM.DD를 우선 추출
+    - 아니면 입력 xlsx 파일명들에서 YY.MM.DD를 추출
+    - 날짜가 없으면 에러
+    - 여러 날짜 섞이면 에러
+    """
+    if input_source == "ZIP 사용" and uploaded_zip is not None:
+        d = _extract_yymmdd_from_name(uploaded_zip.name)
+        if d:
+            return d
+
+    dates = set()
+    for fname, _ in inputs:
+        d = _extract_yymmdd_from_name(fname)
+        if d:
+            dates.add(d)
+
+    if not dates:
+        raise Exception(
+            "파일명에서 날짜(YY.MM.DD)를 찾지 못했습니다.\n"
+            "예: 25.12.14_XXX.xlsx 또는 업로드 ZIP 이름에 25.12.14 포함"
+        )
+
+    if len(dates) > 1:
+        raise Exception(
+            "업로드된 파일들에 날짜가 섞여 있습니다.\n"
+            f"감지된 날짜: {sorted(dates)}\n"
+            "같은 날짜의 파일만 업로드해 주세요."
+        )
+
+    return list(dates)[0]
+
 
 
 def _zip_bytes_from_folder(folder_path: str, zip_name: str) -> bytes:
@@ -505,7 +565,8 @@ if make_btn:
 
     # ZIP 저장(옵션)
     if st.session_state.get("dl_zip", True):
-        zip_name = f"SLB_MES_Result_Package_{_now_mmdd()}.zip"
+        pkg_date = _resolve_package_date(inputs, input_source, uploaded_zip)
+        zip_name = f"SLB_MES_Result_Package_{pkg_date}.zip"
         zip_bytes = _zip_bytes_from_folder(out_dir, zip_name)
         st.session_state["result_zip_name"] = zip_name
         st.session_state["result_zip_bytes"] = zip_bytes
