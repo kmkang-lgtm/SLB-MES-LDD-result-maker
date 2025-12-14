@@ -33,16 +33,10 @@ def parse_result_xlsx(file_path: str):
     wb = openpyxl.load_workbook(file_path, data_only=True)
     records = []
 
-    # ✅ AL1/AL2 분류를 위한 1차 스캔: '-2'가 존재하는 prefix 수집
-    prefixes_with_2 = set()
-    for _ws in wb.worksheets:
-        if _ws.title.lower() == "summary":
-            continue
-        _name = str(_ws.title).strip()
-        if "-" in _name:
-            _prefix, _suffix = _name.rsplit("-", 1)
-            if _suffix.strip() == "2":
-                prefixes_with_2.add(_prefix.strip())
+
+    # ✅ 시트명 목록(set)으로 AL1/AL2 매칭(끝이 -1/-2가 아니어도 동작)
+    sheet_titles = [ws.title for ws in wb.worksheets if ws.title.lower() != "summary"]
+    sheet_set = set(sheet_titles)
 
     for ws in wb.worksheets:
         if ws.title.lower() == "summary":
@@ -67,15 +61,19 @@ def parse_result_xlsx(file_path: str):
         position = ws.title
 
         # ✅ prefix/suffix 기반 Material 분류: AL1/AL2/CU
-        name = str(position).strip()
+        name = str(position)
+
+        # ✅ 기본은 CU
         material = "CU"
-        if "-" in name:
-            prefix, suffix = name.rsplit("-", 1)
-            prefix = prefix.strip()
-            suffix = suffix.strip()
-            if suffix == "2":
-                material = "AL2"
-            elif suffix == "1" and prefix in prefixes_with_2:
+
+        # ✅ 1) "-2"가 들어가면 무조건 AL2 (기존 규칙 유지)
+        if "-2" in name:
+            material = "AL2"
+
+        # ✅ 2) "-1"이고, 같은 네이밍의 "-2" 시트가 실제로 있으면 AL1
+        elif "-1" in name:
+            cand = name.replace("-1", "-2", 1)
+            if cand in sheet_set:
                 material = "AL1"
             else:
                 material = "CU"
