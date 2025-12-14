@@ -370,7 +370,7 @@ def build_from_zip_bytes(zip_bytes: bytes, zip_name: str):
         out_name = f"SLB_MES_Deviation_Summary_{date_str}.xlsx"
         out_path = Path(tmpdir) / out_name
 
-        write_summary_excel(str(out_path), lane1_df, lane2_df, sheet_name=sheet_name)
+        write_summary_excel(str(out_path), lane1_df, lane2_df, sheet_name="Summary")
 
         with open(out_path, "rb") as f:
             out_bytes = f.read()
