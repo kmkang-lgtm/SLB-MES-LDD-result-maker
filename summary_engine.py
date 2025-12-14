@@ -177,7 +177,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         # ---------------------------
         max_col = lane1_df.shape[1]
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
-        tcell = ws.cell(row=1, column=1, value="LDD DAILY Summary")
+        tcell = ws.cell(row=1, column=1, value="Summary")
         tcell.font = title_font
         tcell.fill = fill_title
         tcell.alignment = center
