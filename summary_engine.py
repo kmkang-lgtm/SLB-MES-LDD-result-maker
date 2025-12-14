@@ -175,8 +175,8 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
     import openpyxl
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Lane1 표: startrow=2 -> 헤더는 3행, 데이터는 4행부터
-        lane1_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
+        # Lane1 표: startrow=1 -> 헤더는 2행, 데이터는 3행부터
+        lane1_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=1)
 
         wb = writer.book
         ws = writer.sheets[sheet_name]
@@ -205,19 +205,8 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         tcell.fill = fill_title
         tcell.alignment = center
 
-        # 2행 메타: Summary | YY.MM.DD (나머지는 병합)
-        ws.cell(row=2, column=1, value="Summary").font = meta_font
-        ws.cell(row=2, column=2, value=date_str).font = meta_font
-        for c in range(1, max_col + 1):
-            cell = ws.cell(row=2, column=c)
-            cell.fill = fill_meta
-            cell.border = border
-            cell.alignment = center
-        if max_col >= 3:
-            ws.merge_cells(start_row=2, start_column=3, end_row=2, end_column=max_col)
-
         # Lane1 헤더(3행)
-        header_row = 3
+        header_row = 2
         for c in range(1, max_col + 1):
             cell = ws.cell(row=header_row, column=c)
             cell.font = header_font
@@ -275,7 +264,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
                     cell.number_format = "0.000"
 
         ws.sheet_view.showGridLines = False
-        ws.freeze_panes = "A4"
+        ws.freeze_panes = "A3"
 
 
 # ---------------------------
