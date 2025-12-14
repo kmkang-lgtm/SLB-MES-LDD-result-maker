@@ -177,7 +177,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         # ---------------------------
         max_col = lane1_df.shape[1]
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
-        tcell = ws.cell(row=1, column=1, value="Deviation Summary")
+        tcell = ws.cell(row=1, column=1, value="LDD DAILY Summary")
         tcell.font = title_font
         tcell.fill = fill_title
         tcell.alignment = center
@@ -187,7 +187,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         # ---------------------------
         title1_row = 2
         ws.merge_cells(start_row=title1_row, start_column=1, end_row=title1_row, end_column=max_col)
-        t1 = ws.cell(row=title1_row, column=1, value="(Below) Lane1")
+        t1 = ws.cell(row=title1_row, column=1, value="Lane1")
         t1.font = Font(bold=True, size=12)
         t1.fill = fill_lane
         t1.alignment = center
@@ -227,7 +227,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         # lane2 제목(병합)
         title2_row = startrow2 - 1
         ws.merge_cells(start_row=title2_row, start_column=1, end_row=title2_row, end_column=max_col)
-        t2 = ws.cell(row=title2_row, column=1, value="(Below) Lane2")
+        t2 = ws.cell(row=title2_row, column=1, value="Lane2")
         t2.font = Font(bold=True, size=12)
         t2.fill = fill_lane
         t2.alignment = center
