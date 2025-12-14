@@ -307,6 +307,113 @@ def _normalize_material_from_position(position: str, material_cell: str) -> str:
 # ----------------------------
 # Build dashboard workbook
 # ----------------------------
+# ----------------------------
+# Parsing (NEW Summary layout fallback)
+# ----------------------------
+def _cell_str(x) -> str:
+    return str(x).strip() if x is not None else ""
+
+
+def _is_new_summary_header_row(row_vals) -> bool:
+    # expects: Lane | Position | Material | ...
+    s = [_cell_str(v).lower() for v in row_vals[:3]]
+    return len(s) >= 3 and s[0] == "lane" and s[1] == "position" and s[2] == "material"
+
+
+def _normalize_lane(lane_cell: str) -> str:
+    s = (lane_cell or "").strip().lower()
+    # handle "Lane1", "1Lane", "1", etc.
+    if "2" in s:
+        return "2Lane"
+    if "1" in s:
+        return "1Lane"
+    return ""
+
+
+def _read_new_summary_sheet_to_tidy(ws, mmdd: str) -> pd.DataFrame:
+    """
+    Fallback parser for the new Summary format:
+    - Table headers include: Lane, Position, Material, Mean_WPH, Mean_KHD, Std_WPH, ...
+    - There may be two tables (Lane1 then Lane2) in the same sheet.
+    Returns tidy df with columns:
+      date, dtype, lane, position, material, metric, value
+    """
+    rows = []
+    max_col = ws.max_column or 1
+    for r in range(1, (ws.max_row or 1) + 1):
+        row = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
+        # trim trailing None
+        while row and row[-1] is None:
+            row.pop()
+        rows.append(row)
+
+    header_idxs = [i for i,row in enumerate(rows) if _is_new_summary_header_row(row)]
+    if not header_idxs:
+        raise UserFacingError(
+            title="Summary 형식을 인식하지 못했습니다.",
+            detail=f"파일의 Summary 시트에서 'Lane/Position/Material' 헤더를 찾지 못했습니다.",
+            hint="Summary 파일 양식이 변경되었는지 확인하세요.",
+            code="SUMMARY_NEW_FORMAT_HEADER_NOT_FOUND",
+        )
+
+    metric_pat = re.compile(r"^(Mean|Std|Min|Max|Range)_(WPH|KHD)$", re.IGNORECASE)
+
+    records = []
+    for hi, hidx in enumerate(header_idxs):
+        headers = [str(x).strip() if x is not None else "" for x in rows[hidx]]
+        # define table end: next header or end
+        end = header_idxs[hi+1] if hi+1 < len(header_idxs) else len(rows)
+
+        for rr in range(hidx + 1, end):
+            row = rows[rr]
+            if not row:
+                continue
+
+            # map row values to headers
+            data = {headers[i]: row[i] if i < len(row) else None for i in range(len(headers))}
+            lane = _normalize_lane(_cell_str(data.get("Lane")))
+            pos = _cell_str(data.get("Position"))
+            if not pos:
+                # blank position -> end of this table
+                continue
+            mat_cell = _cell_str(data.get("Material"))
+            material = _normalize_material_from_position(pos, mat_cell)
+
+            for col, val in data.items():
+                m = metric_pat.match(col)
+                if not m:
+                    continue
+                metric = m.group(1).capitalize()
+                dtype = m.group(2).upper()
+
+                if val is None or (isinstance(val, str) and val.strip() == ""):
+                    continue
+                try:
+                    v = float(val)
+                except Exception:
+                    continue
+
+                records.append(
+                    {
+                        "date": mmdd,
+                        "dtype": dtype,
+                        "lane": lane,
+                        "position": pos,
+                        "material": material,
+                        "metric": metric,
+                        "value": v,
+                    }
+                )
+
+    if not records:
+        raise UserFacingError(
+            title="Summary에서 Dashboard용 숫자 데이터를 찾지 못했습니다.",
+            detail="Mean_WPH/Mean_KHD 등의 숫자 컬럼을 파싱하지 못했습니다.",
+            hint="Summary 파일이 비어있거나 컬럼명이 예상과 다른지 확인하세요.",
+            code="SUMMARY_NEW_FORMAT_NO_DATA",
+        )
+
+    return pd.DataFrame(records)
 def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1, start_col: int = 1):
     # headers
     for j, col in enumerate(df.columns, start=start_col):
@@ -331,6 +438,55 @@ def _auto_fit_columns(ws, max_width: int = 50):
         ws.column_dimensions[letter].width = min(max(10, maxlen + 2), max_width)
 
 
+def _style_as_table(ws, header_row: int = 1, freeze_panes: str = "A2", apply_filter: bool = True):
+    """Lightweight styling to make sheets more readable."""
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    max_row = ws.max_row or 1
+    max_col = ws.max_column or 1
+
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Side(style="thin", color="D0D0D0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill("solid", fgColor="F2F2F2")
+
+    # header style
+    for c in range(1, max_col + 1):
+        cell = ws.cell(row=header_row, column=c)
+        cell.font = bold
+        cell.alignment = center
+        cell.fill = header_fill
+        cell.border = border
+
+    # body borders
+    for r in range(header_row + 1, max_row + 1):
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c).border = border
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = freeze_panes
+
+    if apply_filter and max_row >= header_row + 1:
+        from openpyxl.utils import get_column_letter
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(max_col)}{max_row}"
+
+
+def _add_heatmap_color_scale(ws, start_row: int = 2, start_col: int = 2):
+    """Apply a color-scale conditional formatting to numeric area (simple heatmap)."""
+    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.utils import get_column_letter
+
+    max_row = ws.max_row or 1
+    max_col = ws.max_column or 1
+    if max_row < start_row or max_col < start_col:
+        return
+
+    rng = f"{get_column_letter(start_col)}{start_row}:{get_column_letter(max_col)}{max_row}"
+    rule = ColorScaleRule(start_type="min", start_color="FFF2F2F2",
+                          mid_type="percentile", mid_value=50, mid_color="FFBFBFBF",
+                          end_type="max", end_color="FF1F4E79")
+    ws.conditional_formatting.add(rng, rule)
 def _make_pivot(df_all: pd.DataFrame, metric_contains: str) -> pd.DataFrame:
     """
     df_all(tidy)에서 metric에 metric_contains가 포함된 값만 추출하여
@@ -431,11 +587,15 @@ def build_dashboard_from_file_bytes(file_items: List[Tuple[str, bytes]]) -> Tupl
         mmdd = _date_key_from_filename_or_mtime(fname, None)
         mmdd_list.append(mmdd)
 
-        blocks = _infer_blocks_from_sheet(ws)
-        for b in blocks:
-            tidy = _read_block_to_tidy(ws, b, mmdd)
+        try:
+            blocks = _infer_blocks_from_sheet(ws)
+            for b in blocks:
+                tidy = _read_block_to_tidy(ws, b, mmdd)
+                df_all.append(tidy)
+        except Exception:
+            # Fallback: new Summary layout (Lane/Position/Material + Mean_WPH/...)
+            tidy = _read_new_summary_sheet_to_tidy(ws, mmdd)
             df_all.append(tidy)
-
         wb.close()
 
     df_all = pd.concat(df_all, ignore_index=True)
@@ -448,6 +608,7 @@ def build_dashboard_from_file_bytes(file_items: List[Tuple[str, bytes]]) -> Tupl
     ws_all = out_wb.create_sheet("All_Data")
     _write_dataframe(ws_all, df_all)
     _auto_fit_columns(ws_all)
+    _style_as_table(ws_all, header_row=1, freeze_panes='A2', apply_filter=True)
 
     # Pivot sheets
     ws_pos = out_wb.create_sheet("ALL POSITION")
@@ -460,6 +621,7 @@ def build_dashboard_from_file_bytes(file_items: List[Tuple[str, bytes]]) -> Tupl
     )
     _write_dataframe(ws_pos, pos_df)
     _auto_fit_columns(ws_pos)
+    _style_as_table(ws_pos, header_row=1, freeze_panes='A2', apply_filter=True)
 
     # Pivot Mean/Std/Range
     pv_mean = _make_pivot(df_all, "mean|avg")
@@ -470,21 +632,26 @@ def build_dashboard_from_file_bytes(file_items: List[Tuple[str, bytes]]) -> Tupl
     _write_dataframe(ws_pv_mean, pv_mean)
     _append_avg_min_max_formulas(ws_pv_mean, pv_mean)
     _auto_fit_columns(ws_pv_mean)
+    _style_as_table(ws_pv_mean, header_row=1, freeze_panes='A2', apply_filter=True)
 
     ws_pv_std = out_wb.create_sheet("Pivot_Std")
     _write_dataframe(ws_pv_std, pv_std)
     _append_avg_min_max_formulas(ws_pv_std, pv_std)
     _auto_fit_columns(ws_pv_std)
+    _style_as_table(ws_pv_std, header_row=1, freeze_panes='A2', apply_filter=True)
 
     ws_pv_range = out_wb.create_sheet("Pivot_Range")
     _write_dataframe(ws_pv_range, pv_range)
     _append_avg_min_max_formulas(ws_pv_range, pv_range)
     _auto_fit_columns(ws_pv_range)
+    _style_as_table(ws_pv_range, header_row=1, freeze_panes='A2', apply_filter=True)
 
     # Heatmap 시트는 기존 로직에 따라 더 꾸밀 수 있는데, 여기서는 기본 형태로 제공
     ws_hm = out_wb.create_sheet("Heatmap_Mean")
     _write_dataframe(ws_hm, pv_mean)  # 기본은 Pivot_Mean과 동일 데이터
     _auto_fit_columns(ws_hm)
+    _style_as_table(ws_hm, header_row=1, freeze_panes='A2', apply_filter=True)
+    _add_heatmap_color_scale(ws_hm, start_row=2, start_col=2)
 
     dash_name = _dashboard_name_from_dates(mmdd_list)
 
