@@ -3,42 +3,72 @@ import numpy as np
 import zipfile
 import tempfile
 import re
-import time
 import shutil
 import gc
 from pathlib import Path
+from datetime import datetime
 
 
 # ---------------------------
-# 0) zip 파일명에서 날짜 추출
+# 0) zip 파일명에서 날짜 추출 (YY.MM.DD 우선)
 # ---------------------------
-def extract_date_from_zipname(zip_filename: str):
+def extract_date_from_zipname(zip_filename: str) -> str:
+    """
+    기대하는 ZIP 이름 예:
+      SLB_MES_Result_Package_25.11.18.zip  -> 25.11.18
+    하위호환:
+      SLB_MES_Result_Package_11.18.zip     -> 현재 연도(YY) 붙여 25.11.18
+    """
     name = Path(zip_filename).stem
-    m = re.search(r"SLB_MES_Result_Package_(\d{1,2}\.\d{1,2})", name)
-    if not m:
-        return name.split("_")[-1]
-    return m.group(1)
+
+    m = re.search(r"SLB_MES_Result_Package_(\d{2}\.\d{2}\.\d{2})", name)
+    if m:
+        return m.group(1)
+
+    m2 = re.search(r"SLB_MES_Result_Package_(\d{1,2})\.(\d{1,2})", name)
+    if m2:
+        yy = datetime.now().strftime("%y")
+        mm = int(m2.group(1))
+        dd = int(m2.group(2))
+        return f"{yy}.{mm:02d}.{dd:02d}"
+
+    # fallback: 마지막 토큰이라도 사용
+    tail = name.split("_")[-1]
+    # 만약 25.11 형태면 day는 오늘 날짜로 보강
+    m3 = re.fullmatch(r"(\d{2})\.(\d{2})", tail)
+    if m3:
+        yy = m3.group(1)
+        mm = m3.group(2)
+        dd = datetime.now().strftime("%d")
+        return f"{yy}.{mm}.{dd}"
+    return tail
 
 
 # ---------------------------
-# 1) 원본 파일 파싱 규칙
-#
-# - result xlsx는 "Summary" 시트 제외, 각 position(시트명)별로 Raw 영역 값들을 수집
-# - Material: position 이름에 "-2"가 있으면 AL, 아니면 CU (기존 로직 유지)
-# - Mean/Std/Min/Max/Range 계산
+# 1) Result 엑셀에서 Position별 값 수집 → 통계
 # ---------------------------
-def parse_result_xlsx(file_path: str):
+def parse_result_xlsx(file_path: str) -> pd.DataFrame:
     import openpyxl
 
     wb = openpyxl.load_workbook(file_path, data_only=True)
-    records = []
 
+    # ✅ 1) prefix에 "-2"가 존재하는지 먼저 훑어서 AL 그룹 판정(안전하게 suffix 기준)
+    prefixes_with_2 = set()
+    for ws in wb.worksheets:
+        if ws.title.lower() == "summary":
+            continue
+        name = str(ws.title).strip()
+        m = re.match(r"^(.*)-2$", name)
+        if m:
+            prefixes_with_2.add(m.group(1).strip())
+
+    records = []
     for ws in wb.worksheets:
         if ws.title.lower() == "summary":
             continue
 
-        # Raw 영역: 기존 로직(7행부터, 2열부터) 유지
         vals = []
+        # Raw 영역: 7행~, 2열~ (기존 규칙 유지)
         for c in range(2, ws.max_column + 1):
             for r in range(7, ws.max_row + 1):
                 v = ws.cell(row=r, column=c).value
@@ -53,48 +83,55 @@ def parse_result_xlsx(file_path: str):
             continue
 
         arr = np.array(vals, dtype=float)
-        position = ws.title
+        position = str(ws.title).strip()
 
-        material = "AL" if "-2" in position else "CU"
-        mean = float(np.mean(arr))
-        std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-        mn = float(np.min(arr))
-        mx = float(np.max(arr))
-        rg = mx - mn
+        # ✅ Material: 같은 prefix에 -2가 있으면 AL 그룹
+        material = "CU"
+        m1 = re.match(r"^(.*)-1$", position)
+        m2 = re.match(r"^(.*)-2$", position)
+        if m2:
+            material = "AL2"
+        elif m1 and m1.group(1).strip() in prefixes_with_2:
+            material = "AL1"
+        else:
+            # 하위호환: 이름에 -2가 포함되기만 해도 AL2로(혹시 suffix가 깨진 케이스)
+            if "-2" in position:
+                material = "AL2"
 
         records.append(
             {
                 "Position": position,
                 "Material": material,
-                "Mean": mean,
-                "Std": std,
-                "Min": mn,
-                "Max": mx,
-                "Range": rg,
+                "Mean": float(np.mean(arr)),
+                "Std": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0,
+                "Min": float(np.min(arr)),
+                "Max": float(np.max(arr)),
+                "Range": float(np.max(arr) - np.min(arr)),
             }
         )
 
     wb.close()
 
-    if not records:
-        return pd.DataFrame(columns=["Position", "Material", "Mean", "Std", "Min", "Max", "Range"])
+    df = pd.DataFrame(records, columns=["Position", "Material", "Mean", "Std", "Min", "Max", "Range"])
+    if df.empty:
+        return df
 
-    df = pd.DataFrame(records)
-    df = df.sort_values(["Material", "Position"]).reset_index(drop=True)
+    # Material 정렬(AL1 → AL2 → CU)
+    order = {"AL1": 0, "AL2": 1, "AL": 1, "CU": 2}
+    df["_mord"] = df["Material"].map(order).fillna(9).astype(int)
+    df = df.sort_values(["_mord", "Position"]).drop(columns=["_mord"]).reset_index(drop=True)
     return df
 
 
 # ---------------------------
-# 2) 레이아웃용: Lane별 (WPH + KHD) 결합
+# 2) Lane별 WPH/KHD 결합
 # ---------------------------
-def combine_lane_df(wph_df: pd.DataFrame, khd_df: pd.DataFrame, lane_label: str):
-    # WPH/KHD 둘 다 Position 기반 outer merge (기존 구조 유지)
+def combine_lane_df(wph_df: pd.DataFrame, khd_df: pd.DataFrame, lane_label: str) -> pd.DataFrame:
     merged = pd.merge(
         wph_df, khd_df, on=["Position", "Material"], how="outer", suffixes=("_WPH", "_KHD")
     )
 
-    # 컬럼 순서 정리
-    cols = ["Position", "Material"]
+    cols = ["Lane", "Position", "Material"]
     for k in ["Mean", "Std", "Min", "Max", "Range"]:
         cols += [f"{k}_WPH", f"{k}_KHD"]
 
@@ -102,39 +139,29 @@ def combine_lane_df(wph_df: pd.DataFrame, khd_df: pd.DataFrame, lane_label: str)
         if c not in merged.columns:
             merged[c] = np.nan
 
-    merged = merged[cols]
-
-    # lane 라벨(표시용)
     merged.insert(0, "Lane", lane_label)
+    merged = merged[cols]
     return merged
 
 
 # ---------------------------
-# 3) 최종 레이아웃: Lane1 + Lane2 를 "한 시트에" 배치하기 위한 블록 생성
-#    (기존 양식 유지: lane1 블록 + lane2 블록을 한 sheet에 붙임)
+# 3) 엑셀 저장(양식 유지 + 날짜 표기)
 # ---------------------------
-def build_final_layout(lane1_df: pd.DataFrame, lane2_df: pd.DataFrame):
-    # 기존 방식: lane1, lane2 각각 따로 쓰되 한 시트에 블록 형태로 배치
-    # 여기서는 실제 엑셀 쓰기 단계에서 배치하므로 DF는 그대로 반환
-    return lane1_df, lane2_df
+def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.DataFrame, date_str: str):
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    import openpyxl
 
+    sheet_name = "Summary"
 
-# ---------------------------
-# 4) 엑셀 저장(양식 반영)
-# ---------------------------
-def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.DataFrame, sheet_name="Summary"):
-    # 기존 양식 그대로 유지 (pandas + openpyxl 스타일)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # 일단 lane1을 startrow=2에 쓰고, lane2는 아래에 추가로 쓰기
+        # Lane1 표: startrow=2 → header는 3행(row=3)
         lane1_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
 
         wb = writer.book
         ws = writer.sheets[sheet_name]
 
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-
         # ---------------------------
-        # 스타일 정의 (기존 양식 유지)
+        # 스타일 정의
         # ---------------------------
         title_font = Font(bold=True, size=14)
         header_font = Font(bold=True, size=11, color="FFFFFF")
@@ -143,37 +170,49 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
 
         fill_title = PatternFill("solid", fgColor="1F4E79")
         fill_header = PatternFill("solid", fgColor="2F5597")
-        fill_lane = PatternFill("solid", fgColor="D9E1F2")
         fill_alt = PatternFill("solid", fgColor="F7F7F7")
+        fill_meta = PatternFill("solid", fgColor="D9E1F2")
 
         thin = Side(style="thin", color="BFBFBF")
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        # ---------------------------
-        # 상단 제목
-        # ---------------------------
         max_col = lane1_df.shape[1]
+
+        # 1행: 타이틀(날짜 포함)
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
-        tcell = ws.cell(row=1, column=1, value="Deviation Summary")
+        tcell = ws.cell(row=1, column=1, value=f"Deviation Summary ({date_str})")
         tcell.font = title_font
         tcell.fill = fill_title
         tcell.alignment = center
 
-        # ---------------------------
-        # 헤더 스타일
-        # ---------------------------
-        header_row = 3
+        # 2행: Summary | YY.MM.DD
+        ws.cell(row=2, column=1, value="Summary").fill = fill_meta
+        ws.cell(row=2, column=1).font = Font(bold=True)
+        ws.cell(row=2, column=1).alignment = center
+        ws.cell(row=2, column=1).border = border
+
+        ws.cell(row=2, column=2, value=date_str).fill = fill_meta
+        ws.cell(row=2, column=2).font = Font(bold=True)
+        ws.cell(row=2, column=2).alignment = center
+        ws.cell(row=2, column=2).border = border
+
+        if max_col >= 3:
+            ws.merge_cells(start_row=2, start_column=3, end_row=2, end_column=max_col)
+            mcell = ws.cell(row=2, column=3, value="")
+            mcell.fill = fill_meta
+            mcell.border = border
+
+        # Lane1 헤더는 3행
+        header_row_1 = 3
         for c in range(1, max_col + 1):
-            cell = ws.cell(row=header_row, column=c)
+            cell = ws.cell(row=header_row_1, column=c)
             cell.font = header_font
             cell.fill = fill_header
             cell.alignment = center
             cell.border = border
 
-        # ---------------------------
-        # lane1 데이터 영역 스타일
-        # ---------------------------
-        start_data_row_1 = header_row + 1
+        # Lane1 데이터 영역
+        start_data_row_1 = header_row_1 + 1
         end_data_row_1 = start_data_row_1 + len(lane1_df) - 1
 
         for r in range(start_data_row_1, end_data_row_1 + 1):
@@ -184,24 +223,21 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
                 if (r - start_data_row_1) % 2 == 1:
                     cell.fill = fill_alt
 
-        # ---------------------------
-        # lane2 DF를 lane1 아래에 붙여쓰기
-        # ---------------------------
+        # Lane2 표: title 행 없이 한 줄 위로 당김
         gap = 3
-        startrow2 = end_data_row_1 + gap  # lane2 표 시작(타이틀 행 제거)
+        startrow2 = end_data_row_1 + gap  # ✅ +1 제거 (한 줄 위로)
         lane2_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=startrow2)
 
-        # lane2 헤더
-        header_row2 = startrow2 + 1
+        # Lane2 헤더는 startrow2+1
+        header_row_2 = startrow2 + 1
         for c in range(1, max_col + 1):
-            cell = ws.cell(row=header_row2, column=c)
+            cell = ws.cell(row=header_row_2, column=c)
             cell.font = header_font
             cell.fill = fill_header
             cell.alignment = center
             cell.border = border
 
-        # lane2 데이터
-        start_data_row_2 = header_row2 + 1
+        start_data_row_2 = header_row_2 + 1
         end_data_row_2 = start_data_row_2 + len(lane2_df) - 1
 
         for r in range(start_data_row_2, end_data_row_2 + 1):
@@ -212,39 +248,26 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
                 if (r - start_data_row_2) % 2 == 1:
                     cell.fill = fill_alt
 
-        # ---------------------------
-        # 열 너비(기본 고정, 기존 느낌 유지)
-        # ---------------------------
-        widths = {
-            1: 10,   # Lane
-            2: 20,   # Position
-            3: 10,   # Material
-        }
+        # 열 너비
+        widths = {1: 10, 2: 20, 3: 10}
         for c in range(4, max_col + 1):
             widths[c] = 12
-
         for c, w in widths.items():
-            ws.column_dimensions[chr(64 + c)].width = w
+            ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = w
 
-        # ---------------------------
-        # 숫자 포맷
-        # ---------------------------
-        # Mean/Std/Min/Max/Range: 소수점 3자리
+        # 숫자 포맷(소수점 3자리)
         for r in range(start_data_row_1, end_data_row_2 + 1):
             for c in range(4, max_col + 1):
                 cell = ws.cell(row=r, column=c)
                 if isinstance(cell.value, (int, float, np.number)):
                     cell.number_format = "0.000"
 
-        # ---------------------------
-        # Freeze panes / Grid off
-        # ---------------------------
         ws.sheet_view.showGridLines = False
         ws.freeze_panes = "A4"
 
 
 # ---------------------------
-# 5) ZIP bytes → Summary 생성 (외부 API)
+# 4) ZIP bytes → Summary 생성
 # ---------------------------
 def build_from_zip_bytes(zip_bytes: bytes, zip_name: str):
     date_str = extract_date_from_zipname(zip_name)
@@ -260,38 +283,22 @@ def build_from_zip_bytes(zip_bytes: bytes, zip_name: str):
 
         files = list(Path(tmpdir).glob("*.xlsx"))
 
-        # ✅ 파일명 매칭을 더 튼튼하게(엔진 출력명이 달라도 웬만하면 잡도록)
         def pick(dtype: str, lane: str):
             dtype = dtype.lower()
             lane = lane.lower()
 
-            # lane alias들(1lane / 1_lane / lane1 / 1-lane 등)
-            lane_aliases = {
-                lane,
-                lane.replace("lane", "_lane"),
-                lane.replace("lane", "-lane"),
-                lane.replace("lane", "lane"),  # no-op
-            }
+            lane_aliases = {lane, lane.replace("lane", "_lane"), lane.replace("lane", "-lane")}
             if lane == "1lane":
                 lane_aliases |= {"lane1", "1_lane", "1-lane", "lane_1", "lane-1"}
             if lane == "2lane":
                 lane_aliases |= {"lane2", "2_lane", "2-lane", "lane_2", "lane-2"}
 
-            # 1) dtype + lane 모두 포함(강)
             for f in files:
                 name = f.name.lower().replace(" ", "")
                 if dtype in name:
                     for a in lane_aliases:
                         if a.replace(" ", "") in name:
                             return str(f)
-
-            # 2) 마지막 fallback: dtype만 맞고 lane 숫자(1/2)라도 포함하면
-            lane_num = "1" if lane == "1lane" else "2"
-            for f in files:
-                name = f.name.lower().replace(" ", "")
-                if dtype in name and lane_num in name:
-                    return str(f)
-
             return None
 
         wph_1 = pick("wph", "1lane")
@@ -300,32 +307,28 @@ def build_from_zip_bytes(zip_bytes: bytes, zip_name: str):
         khd_2 = pick("khd", "2lane")
 
         missing = [k for k, v in {
-            "wph_1": wph_1,
-            "wph_2": wph_2,
-            "khd_1": khd_1,
-            "khd_2": khd_2,
+            "WPH 1Lane": wph_1, "WPH 2Lane": wph_2,
+            "KHD 1Lane": khd_1, "KHD 2Lane": khd_2,
         }.items() if v is None]
 
         if missing:
-            raise Exception(f"Result 파일이 부족합니다: {missing}\nZIP 안 파일명에 WPH/KHD, 1Lane/2Lane 포함 여부를 확인하세요.")
+            raise Exception(
+                f"Result 파일이 부족합니다: {missing}\n"
+                f"ZIP 안 파일명에 WPH/KHD, 1Lane/2Lane 포함 여부를 확인하세요."
+            )
 
-        # 파싱
         df_wph_1 = parse_result_xlsx(wph_1)
         df_wph_2 = parse_result_xlsx(wph_2)
         df_khd_1 = parse_result_xlsx(khd_1)
         df_khd_2 = parse_result_xlsx(khd_2)
 
-        # Lane별 결합
-        lane1 = combine_lane_df(df_wph_1, df_khd_1, "Lane1")
-        lane2 = combine_lane_df(df_wph_2, df_khd_2, "Lane2")
+        lane1_df = combine_lane_df(df_wph_1, df_khd_1, "Lane1")
+        lane2_df = combine_lane_df(df_wph_2, df_khd_2, "Lane2")
 
-        lane1_df, lane2_df = build_final_layout(lane1, lane2)
-
-        # 출력
         out_name = f"SLB_MES_Deviation_Summary_{date_str}.xlsx"
         out_path = Path(tmpdir) / out_name
 
-        write_summary_excel(str(out_path), lane1_df, lane2_df, sheet_name="Summary")
+        write_summary_excel(str(out_path), lane1_df, lane2_df, date_str=date_str)
 
         with open(out_path, "rb") as f:
             out_bytes = f.read()
@@ -333,7 +336,6 @@ def build_from_zip_bytes(zip_bytes: bytes, zip_name: str):
         return out_name, out_bytes
 
     finally:
-        # cleanup
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
