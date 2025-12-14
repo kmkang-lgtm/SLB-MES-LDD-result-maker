@@ -6,39 +6,17 @@ import re
 import shutil
 import gc
 from pathlib import Path
-from datetime import datetime
 
 
 # ---------------------------
 # 0) zip 파일명에서 날짜 추출
 # ---------------------------
 def extract_date_from_zipname(zip_filename: str):
-    """
-    zip 파일명에서 날짜를 최대한 추출.
-    우선순위:
-      1) YY.MM.DD  (예: 25.11.18)
-      2) YYYY-MM-DD / YYYY.MM.DD
-      3) YY.MM     (예: 25.11)  -> day는 실행일(today)로 보강(구버전 zip 호환)
-    """
     name = Path(zip_filename).stem
-
-    m = re.search(r"(\d{2}\.\d{2}\.\d{2})", name)
-    if m:
-        return m.group(1)
-
-    m = re.search(r"(\d{4})[\.-](\d{2})[\.-](\d{2})", name)
-    if m:
-        yy = m.group(1)[2:]
-        return f"{yy}.{m.group(2)}.{m.group(3)}"
-
-    m = re.search(r"(\d{2}\.\d{2})", name)
-    if m:
-        # 구버전 zip이 YY.MM까지만 포함하는 경우가 있어, day는 today로 보강
-        day = datetime.now().strftime("%d")
-        return f"{m.group(1)}.{day}"
-
-    return datetime.now().strftime("%y.%m.%d")
-
+    m = re.search(r"SLB_MES_Result_Package_(\d{1,2}\.\d{1,2})", name)
+    if not m:
+        return name.split("_")[-1]
+    return m.group(1)
 
 
 # ---------------------------
@@ -209,7 +187,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         # ---------------------------
         title1_row = 2
         ws.merge_cells(start_row=title1_row, start_column=1, end_row=title1_row, end_column=max_col)
-        t1 = ws.cell(row=title1_row, column=1, value="Lane1")
+        t1 = ws.cell(row=title1_row, column=1, value="")
         t1.font = Font(bold=True, size=12)
         t1.fill = fill_lane
         t1.alignment = center
@@ -249,7 +227,7 @@ def write_summary_excel(output_path: str, lane1_df: pd.DataFrame, lane2_df: pd.D
         # lane2 제목(병합)
         title2_row = startrow2 - 1
         ws.merge_cells(start_row=title2_row, start_column=1, end_row=title2_row, end_column=max_col)
-        t2 = ws.cell(row=title2_row, column=1, value="Lane2")
+        t2 = ws.cell(row=title2_row, column=1, value="")
         t2.font = Font(bold=True, size=12)
         t2.fill = fill_lane
         t2.alignment = center
