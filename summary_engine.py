@@ -6,17 +6,39 @@ import re
 import shutil
 import gc
 from pathlib import Path
+from datetime import datetime
 
 
 # ---------------------------
 # 0) zip 파일명에서 날짜 추출
 # ---------------------------
 def extract_date_from_zipname(zip_filename: str):
+    """
+    zip 파일명에서 날짜를 최대한 추출.
+    우선순위:
+      1) YY.MM.DD  (예: 25.11.18)
+      2) YYYY-MM-DD / YYYY.MM.DD
+      3) YY.MM     (예: 25.11)  -> day는 실행일(today)로 보강(구버전 zip 호환)
+    """
     name = Path(zip_filename).stem
-    m = re.search(r"SLB_MES_Result_Package_(\d{1,2}\.\d{1,2})", name)
-    if not m:
-        return name.split("_")[-1]
-    return m.group(1)
+
+    m = re.search(r"(\d{2}\.\d{2}\.\d{2})", name)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(\d{4})[\.-](\d{2})[\.-](\d{2})", name)
+    if m:
+        yy = m.group(1)[2:]
+        return f"{yy}.{m.group(2)}.{m.group(3)}"
+
+    m = re.search(r"(\d{2}\.\d{2})", name)
+    if m:
+        # 구버전 zip이 YY.MM까지만 포함하는 경우가 있어, day는 today로 보강
+        day = datetime.now().strftime("%d")
+        return f"{m.group(1)}.{day}"
+
+    return datetime.now().strftime("%y.%m.%d")
+
 
 
 # ---------------------------

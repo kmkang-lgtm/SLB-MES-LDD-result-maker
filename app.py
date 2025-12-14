@@ -71,8 +71,8 @@ if not st.session_state.authed:
 # ---------------------------
 # Helpers
 # ---------------------------
-def _now_mmdd() -> str:
-    return datetime.now().strftime("%m.%d")
+def _now_yymmdd() -> str:
+    return datetime.now().strftime("%y.%m.%d")
 
 def _extract_yymmdd_from_name(name: str) -> str | None:
     """
